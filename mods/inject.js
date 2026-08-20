@@ -13,7 +13,7 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.9";
+  var VERSION = "0.1.10";
   var REPORT_URL = "http://192.168.0.149:8787/report";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
@@ -75,6 +75,19 @@
   function countSamsungImageAttrs(sdp) {
     var matches = String(sdp || "").match(/^a=imageattr:\d+\s+send\s+/gim);
     return matches ? matches.length : 0;
+  }
+
+  function vkMouseComboButtonOverrides(elapsed) {
+    var forced = { 4: false, 5: false, 8: false, 9: false };
+    if (elapsed < 90) {
+      forced[4] = true;
+      forced[5] = true;
+    } else if (elapsed < 210) {
+      forced[4] = true;
+      forced[5] = true;
+      forced[9] = true;
+    }
+    return forced;
   }
 
   var VK_LAUNCH_MODULE_ID = 10389;
@@ -244,6 +257,11 @@
     var virtualCursorButtons = [];
     var virtualCursorPressTarget = null;
     var streamHintVisible = false;
+    var streamMouseMode = false;
+    var vkMouseComboStartedAt = 0;
+    var vkMouseComboGamepadIndex = -1;
+    var vkMouseComboLatched = false;
+    var vkMouseComboShimInstalled = false;
 
     var state = {
       installed: true,
@@ -264,6 +282,9 @@
       combinedTracks: 0,
       gamepads: [],
       inputMode: "tv-cursor",
+      streamMouseMode: false,
+      vkMouseComboCount: 0,
+      vkMouseComboShim: "not-installed",
       vkBrowserGate: "not-installed",
       reportStatus: "not-sent",
       reportError: null,
@@ -1022,6 +1043,125 @@
       }
     }
 
+    function gamepadButtonPressed(button) {
+      return Boolean(button && (button.pressed || button.value > 0.55));
+    }
+
+    function cloneGamepadForVk(pad, forcedButtons) {
+      var buttons = Array.prototype.map.call(pad.buttons || [], function (button) {
+        return {
+          pressed: Boolean(button && button.pressed),
+          touched: Boolean(button && button.touched),
+          value: button ? Number(button.value || 0) : 0
+        };
+      });
+
+      Object.keys(forcedButtons || {}).forEach(function (buttonIndex) {
+        var pressed = Boolean(forcedButtons[buttonIndex]);
+        while (buttons.length <= Number(buttonIndex)) {
+          buttons.push({ pressed: false, touched: false, value: 0 });
+        }
+        buttons[buttonIndex] = {
+          pressed: pressed,
+          touched: pressed,
+          value: pressed ? 1 : 0
+        };
+      });
+
+      return {
+        id: pad.id,
+        index: pad.index,
+        connected: pad.connected,
+        mapping: pad.mapping,
+        timestamp: pad.timestamp,
+        axes: Array.prototype.slice.call(pad.axes || []),
+        buttons: buttons,
+        hand: pad.hand,
+        pose: pad.pose,
+        vibrationActuator: pad.vibrationActuator,
+        hapticActuators: pad.hapticActuators
+      };
+    }
+
+    function vkGamepadsForPlayer() {
+      var raw = readGamepads();
+      var output = Array.prototype.slice.call(raw || []);
+      if (!vkMouseComboStartedAt && !vkMouseComboLatched) return output;
+
+      var elapsed = vkMouseComboStartedAt
+        ? win.performance.now() - vkMouseComboStartedAt
+        : 9999;
+      for (var index = 0; index < output.length; index += 1) {
+        var pad = output[index];
+        if (!pad || pad.index !== vkMouseComboGamepadIndex) continue;
+
+        var forced = vkMouseComboButtonOverrides(elapsed);
+        output[index] = cloneGamepadForVk(pad, forced);
+      }
+      return output;
+    }
+
+    function installVkMouseComboShim() {
+      if (!nativeGetGamepads || vkMouseComboShimInstalled) return;
+      try {
+        Object.defineProperty(nav, "getGamepads", {
+          configurable: true,
+          value: vkGamepadsForPlayer
+        });
+        vkMouseComboShimInstalled = nav.getGamepads === vkGamepadsForPlayer;
+        state.vkMouseComboShim = vkMouseComboShimInstalled
+          ? "ready"
+          : "unavailable";
+      } catch (error) {
+        state.vkMouseComboShim = "error";
+        recordError("vk-mouse-combo-shim", error);
+      }
+      addEvent(
+        "vk-mouse-combo-shim",
+        vkMouseComboShimInstalled ? "ready" : "unavailable"
+      );
+    }
+
+    function updateVkMouseCombo(pad, streamActive, timestamp) {
+      if (!pad || !streamActive || !vkMouseComboShimInstalled) {
+        if (!streamActive) {
+          vkMouseComboStartedAt = 0;
+          vkMouseComboGamepadIndex = -1;
+          vkMouseComboLatched = false;
+          streamMouseMode = false;
+          state.streamMouseMode = false;
+        }
+        return;
+      }
+      var shouldersPressed =
+        gamepadButtonPressed(pad.buttons[4]) &&
+        gamepadButtonPressed(pad.buttons[5]);
+      var optionsPressed =
+        gamepadButtonPressed(pad.buttons[8]) ||
+        gamepadButtonPressed(pad.buttons[9]);
+      var comboPressed = shouldersPressed && optionsPressed;
+
+      if (comboPressed && !vkMouseComboLatched) {
+        vkMouseComboLatched = true;
+        vkMouseComboStartedAt = timestamp;
+        vkMouseComboGamepadIndex = pad.index;
+        streamMouseMode = !streamMouseMode;
+        state.streamMouseMode = streamMouseMode;
+        state.vkMouseComboCount += 1;
+        state.inputMode = streamMouseMode ? "vk-virtual-mouse" : "vk-gamepad";
+        addEvent(
+          "vk-mouse-combo",
+          streamMouseMode ? "virtual mouse requested" : "gamepad requested"
+        );
+      } else if (!comboPressed && vkMouseComboLatched) {
+        vkMouseComboLatched = false;
+      }
+
+      if (vkMouseComboStartedAt && timestamp - vkMouseComboStartedAt >= 300) {
+        vkMouseComboStartedAt = 0;
+      }
+    }
+
     function firstConnectedGamepad() {
       var pads = readGamepads();
       for (var index = 0; index < pads.length; index += 1) {
@@ -1165,8 +1305,9 @@
       if (!virtualCursor || !virtualCursorHint) return;
       if (streamActive) {
         virtualCursor.style.display = "none";
-        virtualCursorHint.textContent =
-          "Steam: L1 + R1 + Options — мышь · левый стик/×/○ · повтор — геймпад";
+        virtualCursorHint.textContent = streamMouseMode
+          ? "МЫШЬ VK: левый стик · × левый клик · ○ правый клик · правый стик прокрутка · L1+R1+Options — геймпад"
+          : "ГЕЙМПАД VK · L1 + R1 + Options — включить мышь";
         virtualCursorHint.setAttribute("data-stream", "true");
         if (!streamHintVisible) {
           streamHintVisible = true;
@@ -1210,8 +1351,9 @@
       function frame(timestamp) {
         if (!virtualCursor) mount();
         var streamActive = hasActiveGameStream();
-        showCursorMode(streamActive);
         var pad = firstConnectedGamepad();
+        updateVkMouseCombo(pad, streamActive, timestamp);
+        showCursorMode(streamActive);
 
         if (!streamActive && pad && virtualCursor) {
           var elapsed = virtualCursorLastFrame
@@ -1406,7 +1548,15 @@
             id: pad.id,
             mapping: pad.mapping,
             axes: pad.axes.length,
-            buttons: pad.buttons.length
+            buttons: pad.buttons.length,
+            pressedButtons: Array.prototype.reduce.call(
+              pad.buttons,
+              function (pressed, button, buttonIndex) {
+                if (gamepadButtonPressed(button)) pressed.push(buttonIndex);
+                return pressed;
+              },
+              []
+            )
           });
         }
       } catch (error) {
@@ -1598,7 +1748,7 @@
         state.reportStatus +
         "\nVK browser: " +
         state.vkBrowserGate +
-        "\nДо игры: стик = курсор · Steam: L1+R1+Options = мышь";
+        "\nДо игры: стик = курсор · В игре: L1+R1+Options = мышь VK";
     }
 
     function installOverlay() {
@@ -1782,11 +1932,13 @@
       return publicApi;
     }
     if (isCloudHost) {
+      installVkMouseComboShim();
       installVkBrowserGate();
       installRtcShim();
       installMediaShim();
       installFullscreenShim();
     }
+    if (isLocalTestHost) installVkMouseComboShim();
     installStyles();
     installOverlay();
     installVkIdNavigation();
@@ -1804,6 +1956,7 @@
     imageAttr: IMAGE_ATTR,
     patchSamsungSdp: patchSamsungSdp,
     countSamsungImageAttrs: countSamsungImageAttrs,
+    vkMouseComboButtonOverrides: vkMouseComboButtonOverrides,
     wrapVkLaunchFactory: wrapVkLaunchFactory,
     patchVkLaunchFactory: patchVkLaunchFactory,
     patchVkLaunchChunk: patchVkLaunchChunk,
