@@ -1,12 +1,12 @@
 {
   "name": "vkplay-tizenbrew-client",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Samsung Tizen TV compatibility layer for VK Play Cloud",
   "packageType": "mods",
   "appName": "VK Play Cloud TV",
-  "websiteURL": "https://cloud.vkplay.ru/dashboard",
+  "websiteURL": "about:blank#vkplay-tv-bootstrap",
   "main": "mods/inject.js",
-  "evaluateScriptOnDocumentStart": true,
+  "evaluateScriptOnDocumentStart": false,
   "keys": [
     "ColorF0Red",
     "ColorF1Green",
