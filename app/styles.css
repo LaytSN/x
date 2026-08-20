@@ -1,0 +1,277 @@
+:root {
+  color-scheme: dark;
+  --bg: #07090d;
+  --panel: #11151c;
+  --panel-2: #181e28;
+  --line: #2a3442;
+  --text: #f5f7fb;
+  --muted: #9aa6b6;
+  --accent: #b8f23f;
+  --good: #48d77d;
+  --warn: #ffbd3f;
+  --bad: #ff5c6c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 22px;
+}
+
+body {
+  padding-bottom: 76px;
+}
+
+.topbar {
+  position: sticky;
+  z-index: 10;
+  top: 0;
+  min-height: 118px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 32px;
+  padding: 22px 48px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(7, 9, 13, 0.96);
+}
+
+h1,
+h2,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  margin-bottom: 6px;
+  font-size: 35px;
+  line-height: 1.1;
+}
+
+h2 {
+  margin-bottom: 0;
+  font-size: 31px;
+}
+
+.topbar p,
+.hero p,
+.gamepad-panel > p {
+  margin-bottom: 0;
+  color: var(--muted);
+}
+
+main {
+  padding: 28px 48px 80px;
+}
+
+.hero,
+.gamepad-panel,
+.details {
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: linear-gradient(145deg, var(--panel-2), var(--panel));
+}
+
+.hero {
+  display: grid;
+  grid-template-columns: 1.35fr 1fr;
+  gap: 36px;
+  padding: 30px 34px;
+}
+
+.eyebrow {
+  margin-bottom: 9px;
+  color: var(--accent);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.verdict {
+  margin-bottom: 12px;
+  font-size: 38px;
+  font-weight: 800;
+}
+
+.controls-help {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  align-content: center;
+  gap: 14px 20px;
+  color: var(--muted);
+}
+
+.controls-help b {
+  color: var(--text);
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  margin: 18px 0;
+}
+
+.card {
+  min-height: 180px;
+  padding: 24px 26px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--panel);
+}
+
+.card-head,
+.section-title {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.card h3 {
+  margin: 0;
+  font-size: 27px;
+}
+
+.card ul {
+  margin: 18px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.card li {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.8fr) 1.2fr;
+  gap: 18px;
+  padding: 8px 0;
+  border-top: 1px solid rgba(42, 52, 66, 0.62);
+  overflow-wrap: anywhere;
+}
+
+.label {
+  color: var(--muted);
+}
+
+.value {
+  text-align: right;
+  font-family: Menlo, Consolas, monospace;
+  font-size: 18px;
+}
+
+.badge {
+  flex: 0 0 auto;
+  padding: 7px 12px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.good {
+  color: var(--good);
+}
+
+.warn {
+  color: var(--warn);
+}
+
+.bad {
+  color: var(--bad);
+}
+
+.pending {
+  color: var(--muted);
+}
+
+.gamepad-panel,
+.details {
+  margin-top: 18px;
+  padding: 28px 32px;
+}
+
+.gamepads {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 22px;
+}
+
+.gamepads.empty {
+  display: block;
+  color: var(--muted);
+}
+
+.gamepad {
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #0b0e13;
+}
+
+.gamepad strong,
+.gamepad code {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.gamepad code {
+  margin-top: 9px;
+  color: var(--accent);
+}
+
+.input-log,
+.details pre {
+  max-height: 430px;
+  margin: 20px 0 0;
+  padding: 18px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #05070a;
+  color: #c9d3e1;
+  font: 17px/1.5 Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.hidden {
+  display: none;
+}
+
+footer {
+  position: fixed;
+  z-index: 11;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 17px 48px;
+  border-top: 1px solid var(--line);
+  background: rgba(7, 9, 13, 0.97);
+  color: var(--muted);
+  font-size: 17px;
+}
+
+@media (max-width: 1200px) {
+  html,
+  body {
+    font-size: 19px;
+  }
+
+  .hero,
+  .cards {
+    grid-template-columns: 1fr;
+  }
+}

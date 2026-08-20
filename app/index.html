@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <title>VK Play Cloud — диагностика Tizen</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>VK Play Cloud · Tizen diagnostics</h1>
+        <p id="summary">Запускаю проверки телевизора…</p>
+      </div>
+      <div id="run-state" class="badge pending">ПРОВЕРКА</div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div>
+          <div class="eyebrow">Главный вывод</div>
+          <div id="verdict" class="verdict">Собираю факты</div>
+          <p id="verdict-detail">Не выключай экран. Обычно нужно несколько секунд.</p>
+        </div>
+        <div class="controls-help">
+          <span><b>↑ ↓</b> прокрутка</span>
+          <span><b>Красная</b> повторить</span>
+          <span><b>Зелёная</b> отправить на Mac</span>
+          <span><b>Жёлтая</b> подробности</span>
+          <span><b>Синяя</b> тест fullscreen</span>
+        </div>
+      </section>
+
+      <section id="cards" class="cards" aria-live="polite"></section>
+
+      <section class="gamepad-panel">
+        <div class="section-title">
+          <div>
+            <div class="eyebrow">Живой тест</div>
+            <h2>Геймпады и кнопки</h2>
+          </div>
+          <div id="gamepad-status" class="badge pending">ЖДУ ВВОД</div>
+        </div>
+        <p>Нажми любую кнопку и подвигай оба стика. Samsung активирует Gamepad API только после первого движения.</p>
+        <div id="gamepads" class="gamepads empty">Подключённые геймпады пока не обнаружены.</div>
+        <pre id="input-log" class="input-log">События появятся здесь.</pre>
+      </section>
+
+      <section id="details-panel" class="details hidden">
+        <div class="section-title">
+          <div>
+            <div class="eyebrow">Полный отчёт</div>
+            <h2>JSON для разбора</h2>
+          </div>
+        </div>
+        <pre id="details"></pre>
+      </section>
+    </main>
+
+    <footer>
+      <span id="report-target">Mac: http://192.168.0.149:8787/report</span>
+      <span id="clock"></span>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>
