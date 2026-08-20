@@ -994,6 +994,14 @@
     win.__VKPLAY_TIZEN__ = publicApi;
 
     installBrowserShim();
+    if (
+      win.location.hostname === "cloud.vkplay.ru" &&
+      (win.location.pathname === "/" || win.location.pathname === "")
+    ) {
+      addEvent("route", "/dashboard");
+      win.location.replace("https://cloud.vkplay.ru/dashboard");
+      return publicApi;
+    }
     installRtcShim();
     installMediaShim();
     installFullscreenShim();
