@@ -5,6 +5,7 @@
   var REPORT_URL = "http://192.168.0.149:8787/report";
   var WSS_ECHO_URL = "wss://ws.postman-echo.com/raw";
   var report = createEmptyReport();
+  var gamepadAutoReportQueued = false;
   var inputEvents = [];
   var lastGamepadPaint = 0;
   var gamepadActivitySeen = false;
@@ -766,6 +767,10 @@
       if (!latest || latest.type !== "gamepad" || latest.value !== value) {
         recordInput("gamepad", value);
       }
+      if (!gamepadAutoReportQueued) {
+        gamepadAutoReportQueued = true;
+        setTimeout(sendReportToMac, 1800);
+      }
     }
     if (timestamp - lastGamepadPaint > 120) {
       report.gamepads = gamepads.map(gamepadSnapshot);
@@ -947,6 +952,7 @@
     render();
     el.runState.textContent = "ГОТОВО";
     el.runState.className = "badge good";
+    setTimeout(sendReportToMac, 1200);
   }
 
   el.reportTarget.textContent = "Mac: " + REPORT_URL;
