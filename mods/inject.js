@@ -13,7 +13,7 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.2";
+  var VERSION = "0.1.3";
   var REPORT_URL = "http://192.168.0.149:8787/report";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
@@ -91,6 +91,8 @@
     var overlay = null;
     var overlayDetails = null;
     var overlayVisible = false;
+    var previousGamepadButtons = Object.create(null);
+    var authScanTimer = 0;
 
     var state = {
       installed: true,
@@ -554,6 +556,121 @@
       );
     }
 
+    function normalizeActionText(value) {
+      return String(value || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+    }
+
+    function isVisibleElement(node) {
+      if (!node || !node.getBoundingClientRect) return false;
+      var rect = node.getBoundingClientRect();
+      var style = win.getComputedStyle(node);
+      return (
+        rect.width > 1 &&
+        rect.height > 1 &&
+        style.visibility !== "hidden" &&
+        style.display !== "none" &&
+        !node.hidden
+      );
+    }
+
+    function isVkIdActionText(value) {
+      var text = normalizeActionText(value);
+      if (!text || text.length > 100) return false;
+      return (
+        /^vk\s*id$/.test(text) ||
+        /(войти|продолжить|авториз)[^\n]{0,45}vk\s*id/.test(text) ||
+        /vk\s*id[^\n]{0,45}(войти|продолжить|авториз)/.test(text)
+      );
+    }
+
+    function prepareVkIdActions() {
+      var nodes = doc.querySelectorAll("button,a,div,span,[role='button']");
+      var actions = [];
+      Array.prototype.forEach.call(nodes, function (node) {
+        if (!isVisibleElement(node) || !isVkIdActionText(node.textContent)) return;
+
+        var childHasSameAction = Array.prototype.some.call(
+          node.children || [],
+          function (child) {
+            return isVisibleElement(child) && isVkIdActionText(child.textContent);
+          }
+        );
+        if (childHasSameAction) return;
+
+        node.setAttribute("data-vkplay-tv-auth", "true");
+        if (!node.hasAttribute("tabindex")) node.setAttribute("tabindex", "0");
+        if (!node.hasAttribute("role")) node.setAttribute("role", "button");
+        actions.push(node);
+      });
+      return actions;
+    }
+
+    function findVkIdAction() {
+      var prepared = prepareVkIdActions();
+      if (prepared.length) return prepared[0];
+      var existing = doc.querySelector("[data-vkplay-tv-auth='true']");
+      return isVisibleElement(existing) ? existing : null;
+    }
+
+    function activateVkIdAction(source) {
+      var action = findVkIdAction();
+      if (!action) return false;
+      try {
+        action.focus();
+        action.scrollIntoView({ block: "center", inline: "center" });
+        addEvent("vk-id", source || "activate");
+        action.click();
+        return true;
+      } catch (error) {
+        recordError("vk-id", error);
+        return false;
+      }
+    }
+
+    function installVkIdNavigation() {
+      function scan() {
+        win.clearTimeout(authScanTimer);
+        authScanTimer = win.setTimeout(function () {
+          var actions = prepareVkIdActions();
+          if (
+            actions.length &&
+            (!doc.activeElement ||
+              doc.activeElement === doc.body ||
+              doc.activeElement === doc.documentElement)
+          ) {
+            actions[0].focus();
+            actions[0].scrollIntoView({ block: "center", inline: "center" });
+          }
+        }, 100);
+      }
+
+      if (doc.body && win.MutationObserver) {
+        new win.MutationObserver(scan).observe(doc.body, {
+          childList: true,
+          subtree: true
+        });
+      } else {
+        doc.addEventListener(
+          "DOMContentLoaded",
+          function () {
+            if (doc.body && win.MutationObserver) {
+              new win.MutationObserver(scan).observe(doc.body, {
+                childList: true,
+                subtree: true
+              });
+            }
+            scan();
+          },
+          { once: true }
+        );
+      }
+      scan();
+      addEvent("vk-id-navigation", "focus + Enter / gamepad A / blue key");
+    }
+
     function visibleFocusableElements() {
       var selector = [
         "a[href]",
@@ -562,18 +679,11 @@
         "select:not([disabled])",
         "textarea:not([disabled])",
         "[role='button']",
-        "[tabindex]:not([tabindex='-1'])"
+        "[tabindex]:not([tabindex='-1'])",
+        "[data-vkplay-tv-auth='true']"
       ].join(",");
       return Array.prototype.filter.call(doc.querySelectorAll(selector), function (node) {
-        var rect = node.getBoundingClientRect();
-        var style = win.getComputedStyle(node);
-        return (
-          rect.width > 1 &&
-          rect.height > 1 &&
-          style.visibility !== "hidden" &&
-          style.display !== "none" &&
-          !node.hidden
-        );
+        return isVisibleElement(node);
       });
     }
 
@@ -688,6 +798,13 @@
             renderOverlay();
             return;
           }
+          if (keyCode === 406) {
+            if (activateVkIdAction("blue-key")) {
+              event.preventDefault();
+              event.stopPropagation();
+            }
+            return;
+          }
           if (keyCode === 10009) {
             event.preventDefault();
             event.stopPropagation();
@@ -745,6 +862,32 @@
     }
 
     function installGamepadMonitor() {
+      function buttonPressed(button) {
+        return Boolean(button && (button.pressed || button.value > 0.55));
+      }
+
+      function pollGamepadActions() {
+        if (isGameFullscreen()) return;
+        var raw = nav.getGamepads ? nav.getGamepads() : [];
+        for (var index = 0; index < raw.length; index += 1) {
+          var pad = raw[index];
+          if (!pad) continue;
+          var key = String(pad.index);
+          var previous = previousGamepadButtons[key] || [];
+          var confirmPressed = buttonPressed(pad.buttons[0]);
+          var shortcutPressed = buttonPressed(pad.buttons[3]);
+
+          if (
+            (confirmPressed && !previous[0]) ||
+            (shortcutPressed && !previous[3])
+          ) {
+            activateVkIdAction(shortcutPressed ? "gamepad-y" : "gamepad-a");
+          }
+
+          previousGamepadButtons[key] = pad.buttons.map(buttonPressed);
+        }
+      }
+
       win.addEventListener("gamepadconnected", function (event) {
         addEvent("gamepad-connected", event.gamepad.id);
         updateGamepads();
@@ -755,6 +898,7 @@
         updateGamepads();
       });
       win.setInterval(updateGamepads, 1000);
+      win.setInterval(pollGamepadActions, 80);
       updateGamepads();
     }
 
@@ -826,7 +970,7 @@
         state.errors.length +
         " · Отчёт: " +
         state.reportStatus +
-        "\nКрасная: отчёт · зелёная: полный экран · жёлтая: детали";
+        "\nКрасная: отчёт · зелёная: полный экран · жёлтая: детали · синяя: VK ID";
     }
 
     function installOverlay() {
@@ -1007,6 +1151,7 @@
     installFullscreenShim();
     installStyles();
     installOverlay();
+    installVkIdNavigation();
     installRemoteNavigation();
     installGamepadMonitor();
     queueReport(2500);
