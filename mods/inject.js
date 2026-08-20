@@ -13,7 +13,7 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.8";
+  var VERSION = "0.1.9";
   var REPORT_URL = "http://192.168.0.149:8787/report";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
@@ -178,6 +178,16 @@
   function install(win) {
     var currentHostname =
       win && win.location ? String(win.location.hostname || "").toLowerCase() : "";
+    var isTopLevelContext = false;
+    try {
+      isTopLevelContext = win.top === win;
+    } catch (_) {}
+    var isBootstrapPage = Boolean(
+      isTopLevelContext &&
+      win.location &&
+      win.location.protocol === "about:" &&
+      win.location.hash === "#vkplay-tv-bootstrap"
+    );
     var isCloudHost = currentHostname === "cloud.vkplay.ru";
     var isVkPlayAccountHost =
       currentHostname === "account.vkplay.ru" ||
@@ -192,7 +202,13 @@
     var isLocalTestHost =
       currentHostname === "127.0.0.1" && win.__VKPLAY_TIZEN_TEST__ === true;
 
-    if (!isCloudHost && !isVkPlayAccountHost && !isVkAuthHost && !isLocalTestHost) {
+    if (
+      !isBootstrapPage &&
+      !isCloudHost &&
+      !isVkPlayAccountHost &&
+      !isVkAuthHost &&
+      !isLocalTestHost
+    ) {
       return {
         installed: false,
         skipped: true,
@@ -207,10 +223,6 @@
 
     var doc = win.document;
     var nav = win.navigator;
-    var isTopLevelContext = false;
-    try {
-      isTopLevelContext = win.top === win;
-    } catch (_) {}
     var realUserAgent = nav.userAgent;
     var nativeGetGamepads =
       typeof nav.getGamepads === "function" ? nav.getGamepads.bind(nav) : null;
@@ -932,7 +944,7 @@
         );
       }
       scan();
-      addEvent("vk-id-navigation", "focus + Enter / gamepad A / blue key");
+      addEvent("vk-id-navigation", "focus + Enter / gamepad Cross / blue key");
     }
 
     function visibleFocusableElements() {
@@ -1154,7 +1166,7 @@
       if (streamActive) {
         virtualCursor.style.display = "none";
         virtualCursorHint.textContent =
-          "Steam: L1 + R1 + Options — мышь · левый стик/A/B · повтор — геймпад";
+          "Steam: L1 + R1 + Options — мышь · левый стик/×/○ · повтор — геймпад";
         virtualCursorHint.setAttribute("data-stream", "true");
         if (!streamHintVisible) {
           streamHintVisible = true;
@@ -1164,7 +1176,7 @@
       } else {
         virtualCursor.style.display = "block";
         virtualCursorHint.textContent =
-          "Стик: курсор · A: нажать · правый стик: прокрутка · B: назад";
+          "Стик: курсор · ×: нажать · правый стик: прокрутка · ○: назад";
         virtualCursorHint.setAttribute("data-stream", "false");
         if (streamHintVisible) {
           streamHintVisible = false;
@@ -1259,7 +1271,7 @@
         virtualCursorY = Math.max(8, Math.min(win.innerHeight - 8, virtualCursorY));
       });
       win.requestAnimationFrame(frame);
-      addEvent("virtual-cursor", "left stick + A; right stick scroll");
+      addEvent("virtual-cursor", "left stick + Cross; right stick scroll");
     }
 
     function activateFocusedElement(source) {
@@ -1755,6 +1767,12 @@
     win.__VKPLAY_TIZEN__ = publicApi;
 
     installBrowserShim();
+    if (isBootstrapPage) {
+      state.inputMode = "bootstrap";
+      addEvent("bootstrap", "opening VK after module cache warm-up");
+      win.location.replace("https://cloud.vkplay.ru/dashboard");
+      return publicApi;
+    }
     if (
       win.location.hostname === "cloud.vkplay.ru" &&
       (win.location.pathname === "/" || win.location.pathname === "")
