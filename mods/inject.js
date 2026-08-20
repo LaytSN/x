@@ -13,11 +13,11 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.0";
+  var VERSION = "0.1.2";
   var REPORT_URL = "http://192.168.0.149:8787/report";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+    "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) " +
     "AppleWebKit/537.36 (KHTML, like Gecko) " +
     "Chrome/120.0.0.0 Safari/537.36";
   var IMAGE_ATTR = "send [x=[960:1920],y=[540:1080],fps=[60:60]]";
@@ -182,20 +182,20 @@
         fullVersionList: fullVersionList,
         mobile: false,
         model: "",
-        platform: "Windows",
-        platformVersion: "15.0.0",
+        platform: "Chrome OS",
+        platformVersion: "14541.0.0",
         uaFullVersion: "120.0.6099.5",
         wow64: false
       };
       var userAgentData = {
         brands: brands,
         mobile: false,
-        platform: "Windows",
+        platform: "Chrome OS",
         getHighEntropyValues: function (hints) {
           var result = {
             brands: brands,
             mobile: false,
-            platform: "Windows"
+            platform: "Chrome OS"
           };
           (hints || []).forEach(function (hint) {
             if (Object.prototype.hasOwnProperty.call(highEntropy, hint)) {
@@ -208,18 +208,18 @@
           return {
             brands: brands,
             mobile: false,
-            platform: "Windows"
+            platform: "Chrome OS"
           };
         }
       };
 
       var uaReady = defineNavigatorValue("userAgent", SPOOFED_UA);
-      var platformReady = defineNavigatorValue("platform", "Win32");
+      var platformReady = defineNavigatorValue("platform", "Linux x86_64");
       var uaDataReady = defineNavigatorValue("userAgentData", userAgentData);
       state.browserShim = uaReady && platformReady && uaDataReady;
       addEvent(
         "browser-shim",
-        state.browserShim ? "Chrome 120 / Windows" : "partial"
+        state.browserShim ? "Chrome 120 / Chrome OS" : "partial"
       );
     }
 
