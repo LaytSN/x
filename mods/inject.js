@@ -13,7 +13,7 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.6";
+  var VERSION = "0.1.7";
   var REPORT_URL = "http://192.168.0.149:8787/report";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
@@ -1274,8 +1274,7 @@
       }
 
       function pollGamepadActions() {
-        if (hasActiveGameStream()) return;
-        if (isTopLevelContext) return;
+        if (isGameFullscreen()) return;
         var raw = readGamepads();
         for (var index = 0; index < raw.length; index += 1) {
           var pad = raw[index];
@@ -1400,7 +1399,7 @@
         state.errors.length +
         " · Отчёт: " +
         state.reportStatus +
-        "\nДо игры: стик = курсор · В Steam: L1+R1+Options = мышь";
+        "\nСтик/D-pad: выбор · A: нажать · B: назад · Steam: L1+R1+Options = мышь";
     }
 
     function installOverlay() {
@@ -1585,7 +1584,6 @@
     installOverlay();
     installVkIdNavigation();
     installRemoteNavigation();
-    installVirtualCursor();
     installGamepadMonitor();
     if (isCloudHost) queueReport(2500);
 
