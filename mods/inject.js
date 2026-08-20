@@ -13,7 +13,7 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.4";
+  var VERSION = "0.1.5";
   var REPORT_URL = "http://192.168.0.149:8787/report";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
@@ -81,12 +81,18 @@
     var currentHostname =
       win && win.location ? String(win.location.hostname || "").toLowerCase() : "";
     var isCloudHost = currentHostname === "cloud.vkplay.ru";
+    var isVkPlayAccountHost =
+      currentHostname === "account.vkplay.ru" ||
+      currentHostname === "auth-ac.vkplay.ru";
     var isVkAuthHost =
+      currentHostname === "id.vk.ru" ||
+      currentHostname === "oauth.vk.ru" ||
+      currentHostname === "login.vk.ru" ||
       currentHostname === "id.vk.com" ||
       currentHostname === "oauth.vk.com" ||
       currentHostname === "login.vk.com";
 
-    if (!isCloudHost && !isVkAuthHost) {
+    if (!isCloudHost && !isVkPlayAccountHost && !isVkAuthHost) {
       return {
         installed: false,
         skipped: true,
@@ -109,6 +115,7 @@
     var overlayDetails = null;
     var overlayVisible = false;
     var previousGamepadButtons = Object.create(null);
+    var gamepadNavigationState = Object.create(null);
     var authScanTimer = 0;
 
     var state = {
@@ -625,21 +632,61 @@
       return actions;
     }
 
+    function prepareVkIdFrames() {
+      var frames = doc.querySelectorAll("iframe[src]");
+      var actions = [];
+      Array.prototype.forEach.call(frames, function (frame) {
+        var source = String(frame.getAttribute("src") || "").toLowerCase();
+        if (
+          !isVisibleElement(frame) ||
+          (source.indexOf("id.vk.ru/") === -1 &&
+            source.indexOf("id.vk.com/") === -1)
+        ) {
+          return;
+        }
+        frame.setAttribute("data-vkplay-tv-auth-frame", "true");
+        frame.setAttribute("tabindex", "0");
+        frame.setAttribute("aria-label", "Войти через VK ID");
+        actions.push(frame);
+      });
+      return actions;
+    }
+
     function findVkIdAction() {
       var prepared = prepareVkIdActions();
       if (prepared.length) return prepared[0];
+      var frames = prepareVkIdFrames();
+      if (frames.length) return frames[0];
       var existing = doc.querySelector("[data-vkplay-tv-auth='true']");
       return isVisibleElement(existing) ? existing : null;
+    }
+
+    function focusElement(node) {
+      if (!node) return false;
+      try {
+        node.focus();
+        node.scrollIntoView({ block: "center", inline: "center" });
+        if (
+          node.tagName === "IFRAME" &&
+          node.contentWindow &&
+          typeof node.contentWindow.focus === "function"
+        ) {
+          node.contentWindow.focus();
+        }
+        return true;
+      } catch (error) {
+        recordError("focus", error);
+        return false;
+      }
     }
 
     function activateVkIdAction(source) {
       var action = findVkIdAction();
       if (!action) return false;
       try {
-        action.focus();
-        action.scrollIntoView({ block: "center", inline: "center" });
+        focusElement(action);
         addEvent("vk-id", source || "activate");
-        action.click();
+        if (action.tagName !== "IFRAME") action.click();
         return true;
       } catch (error) {
         recordError("vk-id", error);
@@ -651,15 +698,14 @@
       function scan() {
         win.clearTimeout(authScanTimer);
         authScanTimer = win.setTimeout(function () {
-          var actions = prepareVkIdActions();
+          var actions = prepareVkIdActions().concat(prepareVkIdFrames());
           if (
             actions.length &&
             (!doc.activeElement ||
               doc.activeElement === doc.body ||
               doc.activeElement === doc.documentElement)
           ) {
-            actions[0].focus();
-            actions[0].scrollIntoView({ block: "center", inline: "center" });
+            focusElement(actions[0]);
           }
         }, 100);
       }
@@ -695,6 +741,7 @@
         "input:not([disabled])",
         "select:not([disabled])",
         "textarea:not([disabled])",
+        "iframe[data-vkplay-tv-auth-frame='true']",
         "[role='button']",
         "[tabindex]:not([tabindex='-1'])",
         "[data-vkplay-tv-auth='true']"
@@ -709,9 +756,7 @@
       if (!nodes.length) return false;
       var active = doc.activeElement;
       if (nodes.indexOf(active) === -1) {
-        nodes[0].focus();
-        nodes[0].scrollIntoView({ block: "center", inline: "center" });
-        return true;
+        return focusElement(nodes[0]);
       }
 
       var current = active.getBoundingClientRect();
@@ -752,9 +797,39 @@
       });
 
       if (!best) return false;
-      best.focus();
-      best.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
-      return true;
+      return focusElement(best);
+    }
+
+    function activateFocusedElement(source) {
+      var active = doc.activeElement;
+      if (!active || active === doc.body || active === doc.documentElement) {
+        return false;
+      }
+
+      if (active.tagName === "IFRAME") {
+        focusElement(active);
+        addEvent("auth-frame", source || "focus");
+        return true;
+      }
+
+      if (typeof active.click !== "function") return false;
+      try {
+        active.click();
+        addEvent("activate", source || active.tagName);
+        return true;
+      } catch (error) {
+        recordError("activate", error);
+        return false;
+      }
+    }
+
+    function goBack() {
+      var exit = doc.webkitExitFullscreen || doc.exitFullscreen;
+      if (doc.webkitFullscreenElement || doc.fullscreenElement) {
+        if (exit) exit.call(doc);
+      } else if (win.history.length > 1) {
+        win.history.back();
+      }
     }
 
     function isGameFullscreen() {
@@ -825,30 +900,26 @@
           if (keyCode === 10009) {
             event.preventDefault();
             event.stopPropagation();
-            var exit = doc.webkitExitFullscreen || doc.exitFullscreen;
-            if (doc.webkitFullscreenElement || doc.fullscreenElement) {
-              if (exit) exit.call(doc);
-            } else if (win.history.length > 1) {
-              win.history.back();
-            }
+            goBack();
             return;
           }
 
           if (isGameFullscreen()) return;
 
-          var direction = directions[event.key];
+          var direction = directions[event.key] || {
+            37: "left",
+            38: "up",
+            39: "right",
+            40: "down"
+          }[keyCode];
           if (direction && moveFocus(direction)) {
             event.preventDefault();
             event.stopPropagation();
             return;
           }
 
-          if (event.key === "Enter" && doc.activeElement) {
-            var active = doc.activeElement;
-            if (typeof active.click === "function") {
-              event.preventDefault();
-              active.click();
-            }
+          if ((event.key === "Enter" || keyCode === 13) && doc.activeElement) {
+            if (activateFocusedElement("remote-enter")) event.preventDefault();
           }
         },
         true
@@ -883,6 +954,54 @@
         return Boolean(button && (button.pressed || button.value > 0.55));
       }
 
+      function gamepadDirection(pad) {
+        if (buttonPressed(pad.buttons[12])) return "up";
+        if (buttonPressed(pad.buttons[13])) return "down";
+        if (buttonPressed(pad.buttons[14])) return "left";
+        if (buttonPressed(pad.buttons[15])) return "right";
+        if (pad.axes[1] < -0.55) return "up";
+        if (pad.axes[1] > 0.55) return "down";
+        if (pad.axes[0] < -0.55) return "left";
+        if (pad.axes[0] > 0.55) return "right";
+        return "";
+      }
+
+      function navigateFromGamepad(pad, key) {
+        var now = Date.now();
+        var direction = gamepadDirection(pad);
+        var navState = gamepadNavigationState[key] || {
+          direction: "",
+          startedAt: 0,
+          lastMoveAt: 0
+        };
+
+        if (!direction) {
+          navState.direction = "";
+          navState.startedAt = 0;
+          navState.lastMoveAt = 0;
+          gamepadNavigationState[key] = navState;
+          return;
+        }
+
+        var shouldMove = false;
+        if (direction !== navState.direction) {
+          navState.direction = direction;
+          navState.startedAt = now;
+          shouldMove = true;
+        } else if (
+          now - navState.startedAt >= 420 &&
+          now - navState.lastMoveAt >= 140
+        ) {
+          shouldMove = true;
+        }
+
+        if (shouldMove && moveFocus(direction)) {
+          navState.lastMoveAt = now;
+          addEvent("gamepad-nav", direction);
+        }
+        gamepadNavigationState[key] = navState;
+      }
+
       function pollGamepadActions() {
         if (isGameFullscreen()) return;
         var raw = nav.getGamepads ? nav.getGamepads() : [];
@@ -892,13 +1011,21 @@
           var key = String(pad.index);
           var previous = previousGamepadButtons[key] || [];
           var confirmPressed = buttonPressed(pad.buttons[0]);
+          var backPressed = buttonPressed(pad.buttons[1]);
           var shortcutPressed = buttonPressed(pad.buttons[3]);
 
-          if (
-            (confirmPressed && !previous[0]) ||
-            (shortcutPressed && !previous[3])
-          ) {
-            activateVkIdAction(shortcutPressed ? "gamepad-y" : "gamepad-a");
+          navigateFromGamepad(pad, key);
+
+          if (confirmPressed && !previous[0]) {
+            if (!activateFocusedElement("gamepad-a")) {
+              if (!activateVkIdAction("gamepad-a")) moveFocus("down");
+            }
+          }
+          if (backPressed && !previous[1]) {
+            goBack();
+          }
+          if (shortcutPressed && !previous[3]) {
+            activateVkIdAction("gamepad-y");
           }
 
           previousGamepadButtons[key] = pad.buttons.map(buttonPressed);
@@ -928,7 +1055,7 @@
           "html,body{width:100%;height:100%;margin:0;overscroll-behavior:none}" +
           "body{overflow-x:hidden}" +
           "a:focus,button:focus,input:focus,select:focus,textarea:focus," +
-          "[role=button]:focus,[tabindex]:focus{" +
+          "iframe:focus,[role=button]:focus,[tabindex]:focus{" +
           "outline:4px solid #b6e824!important;outline-offset:4px!important;" +
           "box-shadow:0 0 0 8px rgba(182,232,36,.25)!important}" +
           "#vkplay-tizen-tv-overlay{position:fixed;z-index:2147483647;right:24px;" +
@@ -987,7 +1114,7 @@
         state.errors.length +
         " · Отчёт: " +
         state.reportStatus +
-        "\nКрасная: отчёт · зелёная: полный экран · жёлтая: детали · синяя: VK ID";
+        "\nПульт/стик: навигация · A/OK: выбрать · B/Back: назад · Y/синяя: VK ID";
     }
 
     function installOverlay() {
@@ -1163,15 +1290,17 @@
       win.location.replace("https://cloud.vkplay.ru/dashboard");
       return publicApi;
     }
-    installRtcShim();
-    installMediaShim();
-    installFullscreenShim();
+    if (isCloudHost) {
+      installRtcShim();
+      installMediaShim();
+      installFullscreenShim();
+    }
     installStyles();
     installOverlay();
     installVkIdNavigation();
     installRemoteNavigation();
     installGamepadMonitor();
-    queueReport(2500);
+    if (isCloudHost) queueReport(2500);
 
     addEvent("installed", VERSION);
     return publicApi;
