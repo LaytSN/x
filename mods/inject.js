@@ -13,7 +13,7 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.5";
+  var VERSION = "0.1.6";
   var REPORT_URL = "http://192.168.0.149:8787/report";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
@@ -91,8 +91,10 @@
       currentHostname === "id.vk.com" ||
       currentHostname === "oauth.vk.com" ||
       currentHostname === "login.vk.com";
+    var isLocalTestHost =
+      currentHostname === "127.0.0.1" && win.__VKPLAY_TIZEN_TEST__ === true;
 
-    if (!isCloudHost && !isVkPlayAccountHost && !isVkAuthHost) {
+    if (!isCloudHost && !isVkPlayAccountHost && !isVkAuthHost && !isLocalTestHost) {
       return {
         installed: false,
         skipped: true,
@@ -107,7 +109,13 @@
 
     var doc = win.document;
     var nav = win.navigator;
+    var isTopLevelContext = false;
+    try {
+      isTopLevelContext = win.top === win;
+    } catch (_) {}
     var realUserAgent = nav.userAgent;
+    var nativeGetGamepads =
+      typeof nav.getGamepads === "function" ? nav.getGamepads.bind(nav) : null;
     var peerConnections = [];
     var recentEvents = [];
     var reportTimer = 0;
@@ -117,6 +125,15 @@
     var previousGamepadButtons = Object.create(null);
     var gamepadNavigationState = Object.create(null);
     var authScanTimer = 0;
+    var virtualCursor = null;
+    var virtualCursorHint = null;
+    var virtualCursorTarget = null;
+    var virtualCursorX = 0;
+    var virtualCursorY = 0;
+    var virtualCursorLastFrame = 0;
+    var virtualCursorButtons = [];
+    var virtualCursorPressTarget = null;
+    var streamHintVisible = false;
 
     var state = {
       installed: true,
@@ -136,6 +153,7 @@
       audioTracks: 0,
       combinedTracks: 0,
       gamepads: [],
+      inputMode: "tv-cursor",
       reportStatus: "not-sent",
       reportError: null,
       errors: []
@@ -800,6 +818,266 @@
       return focusElement(best);
     }
 
+    function readGamepads() {
+      try {
+        return nativeGetGamepads ? nativeGetGamepads() || [] : [];
+      } catch (error) {
+        recordError("gamepad-read", error);
+        return [];
+      }
+    }
+
+    function firstConnectedGamepad() {
+      var pads = readGamepads();
+      for (var index = 0; index < pads.length; index += 1) {
+        if (pads[index]) return pads[index];
+      }
+      return null;
+    }
+
+    function hasActiveGameStream() {
+      var player = doc.getElementById("player");
+      var stream = player && player.srcObject;
+      return Boolean(
+        stream &&
+          typeof stream.getVideoTracks === "function" &&
+          stream.getVideoTracks().length
+      );
+    }
+
+    function interactiveCursorTarget(node) {
+      if (!node || node === virtualCursor || node === virtualCursorHint) return null;
+      if (typeof node.closest !== "function") return node;
+      return (
+        node.closest(
+          "a[href],button,input,select,textarea,[role='button']," +
+            "[onclick],[tabindex]:not([tabindex='-1'])"
+        ) || node
+      );
+    }
+
+    function setVirtualCursorTarget(node) {
+      var target = interactiveCursorTarget(node);
+      if (target === virtualCursorTarget) return target;
+      if (virtualCursorTarget && virtualCursorTarget.removeAttribute) {
+        virtualCursorTarget.removeAttribute("data-vkplay-tv-pointer-target");
+      }
+      virtualCursorTarget = target;
+      if (virtualCursorTarget && virtualCursorTarget.setAttribute) {
+        virtualCursorTarget.setAttribute("data-vkplay-tv-pointer-target", "true");
+      }
+      return target;
+    }
+
+    function targetUnderVirtualCursor() {
+      return setVirtualCursorTarget(
+        doc.elementFromPoint(
+          Math.max(0, Math.min(win.innerWidth - 1, virtualCursorX)),
+          Math.max(0, Math.min(win.innerHeight - 1, virtualCursorY))
+        )
+      );
+    }
+
+    function dispatchPointerEvent(target, type, button, buttons) {
+      if (!target || typeof target.dispatchEvent !== "function") return false;
+      var common = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: win,
+        clientX: Math.round(virtualCursorX),
+        clientY: Math.round(virtualCursorY),
+        screenX: Math.round(virtualCursorX),
+        screenY: Math.round(virtualCursorY),
+        button: button || 0,
+        buttons: buttons || 0
+      };
+      try {
+        if (win.PointerEvent && type.indexOf("pointer") === 0) {
+          target.dispatchEvent(
+            new win.PointerEvent(type, Object.assign({}, common, {
+              pointerId: 1,
+              pointerType: "mouse",
+              isPrimary: true
+            }))
+          );
+        } else {
+          target.dispatchEvent(new win.MouseEvent(type, common));
+        }
+        return true;
+      } catch (error) {
+        recordError("virtual-cursor-event", error);
+        return false;
+      }
+    }
+
+    function dispatchVirtualCursorMove() {
+      var target = targetUnderVirtualCursor();
+      if (!target) return;
+      dispatchPointerEvent(target, "pointermove", 0, 0);
+      dispatchPointerEvent(target, "mousemove", 0, 0);
+    }
+
+    function pressVirtualCursor() {
+      var target = targetUnderVirtualCursor();
+      if (!target) return;
+      virtualCursorPressTarget = target;
+      focusElement(target);
+      dispatchPointerEvent(target, "pointerdown", 0, 1);
+      dispatchPointerEvent(target, "mousedown", 0, 1);
+    }
+
+    function releaseVirtualCursor() {
+      var target = virtualCursorPressTarget || targetUnderVirtualCursor();
+      virtualCursorPressTarget = null;
+      if (!target) return;
+      dispatchPointerEvent(target, "pointerup", 0, 0);
+      dispatchPointerEvent(target, "mouseup", 0, 0);
+      dispatchPointerEvent(target, "click", 0, 0);
+      addEvent("virtual-cursor", "click");
+    }
+
+    function scrollVirtualCursor(deltaY) {
+      var target = targetUnderVirtualCursor() || doc.body;
+      if (!target) return;
+      try {
+        target.dispatchEvent(
+          new win.WheelEvent("wheel", {
+            bubbles: true,
+            cancelable: true,
+            view: win,
+            clientX: Math.round(virtualCursorX),
+            clientY: Math.round(virtualCursorY),
+            deltaY: deltaY,
+            deltaMode: 0
+          })
+        );
+      } catch (_) {
+        win.scrollBy(0, deltaY);
+      }
+    }
+
+    function normalizedCursorAxis(value) {
+      var deadzone = 0.16;
+      var absolute = Math.abs(value || 0);
+      if (absolute <= deadzone) return 0;
+      var normalized = (absolute - deadzone) / (1 - deadzone);
+      return (value < 0 ? -1 : 1) * Math.pow(normalized, 1.55);
+    }
+
+    function showCursorMode(streamActive) {
+      if (!virtualCursor || !virtualCursorHint) return;
+      if (streamActive) {
+        virtualCursor.style.display = "none";
+        virtualCursorHint.textContent =
+          "Steam: L1 + R1 + Options — мышь · левый стик/A/B · повтор — геймпад";
+        virtualCursorHint.setAttribute("data-stream", "true");
+        if (!streamHintVisible) {
+          streamHintVisible = true;
+          state.inputMode = "vk-stream";
+          addEvent("input-mode", "VK stream; L1+R1+Options toggles virtual mouse");
+        }
+      } else {
+        virtualCursor.style.display = "block";
+        virtualCursorHint.textContent =
+          "Стик: курсор · A: нажать · правый стик: прокрутка · B: назад";
+        virtualCursorHint.setAttribute("data-stream", "false");
+        if (streamHintVisible) {
+          streamHintVisible = false;
+          state.inputMode = "tv-cursor";
+          addEvent("input-mode", "TV cursor");
+        }
+      }
+    }
+
+    function installVirtualCursor() {
+      if (!isTopLevelContext) return;
+
+      function mount() {
+        if (!doc.body || virtualCursor) return;
+        virtualCursor = doc.createElement("div");
+        virtualCursor.id = "vkplay-tizen-tv-cursor";
+        virtualCursor.setAttribute("aria-hidden", "true");
+        virtualCursorHint = doc.createElement("div");
+        virtualCursorHint.id = "vkplay-tizen-tv-input-hint";
+        virtualCursorHint.setAttribute("aria-hidden", "true");
+        doc.body.appendChild(virtualCursor);
+        doc.body.appendChild(virtualCursorHint);
+        virtualCursorX = win.innerWidth / 2;
+        virtualCursorY = win.innerHeight / 2;
+        virtualCursor.style.left = virtualCursorX + "px";
+        virtualCursor.style.top = virtualCursorY + "px";
+        showCursorMode(hasActiveGameStream());
+        targetUnderVirtualCursor();
+      }
+
+      function frame(timestamp) {
+        if (!virtualCursor) mount();
+        var streamActive = hasActiveGameStream();
+        showCursorMode(streamActive);
+        var pad = firstConnectedGamepad();
+
+        if (!streamActive && pad && virtualCursor) {
+          var elapsed = virtualCursorLastFrame
+            ? Math.min(50, timestamp - virtualCursorLastFrame)
+            : 16;
+          var axisX = normalizedCursorAxis(pad.axes[0]);
+          var axisY = normalizedCursorAxis(pad.axes[1]);
+          var speed = Math.max(900, Math.min(win.innerWidth, win.innerHeight) * 1.25);
+          var moved = axisX !== 0 || axisY !== 0;
+
+          if (moved) {
+            virtualCursorX = Math.max(
+              8,
+              Math.min(win.innerWidth - 8, virtualCursorX + axisX * speed * elapsed / 1000)
+            );
+            virtualCursorY = Math.max(
+              8,
+              Math.min(win.innerHeight - 8, virtualCursorY + axisY * speed * elapsed / 1000)
+            );
+            virtualCursor.style.left = virtualCursorX + "px";
+            virtualCursor.style.top = virtualCursorY + "px";
+            dispatchVirtualCursorMove();
+          }
+
+          var confirmPressed = Boolean(
+            pad.buttons[0] && (pad.buttons[0].pressed || pad.buttons[0].value > 0.55)
+          );
+          var backPressed = Boolean(
+            pad.buttons[1] && (pad.buttons[1].pressed || pad.buttons[1].value > 0.55)
+          );
+
+          if (confirmPressed && !virtualCursorButtons[0]) pressVirtualCursor();
+          if (!confirmPressed && virtualCursorButtons[0]) releaseVirtualCursor();
+          if (backPressed && !virtualCursorButtons[1]) goBack();
+
+          var scrollAxis = normalizedCursorAxis(pad.axes[3]);
+          if (scrollAxis) scrollVirtualCursor(scrollAxis * 34);
+          virtualCursorButtons = Array.prototype.map.call(
+            pad.buttons,
+            function (button) {
+              return Boolean(button && (button.pressed || button.value > 0.55));
+            }
+          );
+        } else if (streamActive) {
+          virtualCursorButtons = [];
+          virtualCursorPressTarget = null;
+        }
+
+        virtualCursorLastFrame = timestamp;
+        win.requestAnimationFrame(frame);
+      }
+
+      if (doc.body) mount();
+      else doc.addEventListener("DOMContentLoaded", mount, { once: true });
+      win.addEventListener("resize", function () {
+        virtualCursorX = Math.max(8, Math.min(win.innerWidth - 8, virtualCursorX));
+        virtualCursorY = Math.max(8, Math.min(win.innerHeight - 8, virtualCursorY));
+      });
+      win.requestAnimationFrame(frame);
+      addEvent("virtual-cursor", "left stick + A; right stick scroll");
+    }
+
     function activateFocusedElement(source) {
       var active = doc.activeElement;
       if (!active || active === doc.body || active === doc.documentElement) {
@@ -834,14 +1112,7 @@
 
     function isGameFullscreen() {
       var fullscreen = doc.webkitFullscreenElement || doc.fullscreenElement;
-      var player = doc.getElementById("player");
-      var stream = player && player.srcObject;
-      return Boolean(
-        fullscreen &&
-          stream &&
-          typeof stream.getVideoTracks === "function" &&
-          stream.getVideoTracks().length
-      );
+      return Boolean(fullscreen && hasActiveGameStream());
     }
 
     function requestFullscreen() {
@@ -930,7 +1201,7 @@
     function updateGamepads() {
       var pads = [];
       try {
-        var raw = nav.getGamepads ? nav.getGamepads() : [];
+        var raw = readGamepads();
         for (var index = 0; index < raw.length; index += 1) {
           var pad = raw[index];
           if (!pad) continue;
@@ -1003,8 +1274,9 @@
       }
 
       function pollGamepadActions() {
-        if (isGameFullscreen()) return;
-        var raw = nav.getGamepads ? nav.getGamepads() : [];
+        if (hasActiveGameStream()) return;
+        if (isTopLevelContext) return;
+        var raw = readGamepads();
         for (var index = 0; index < raw.length; index += 1) {
           var pad = raw[index];
           if (!pad) continue;
@@ -1058,6 +1330,20 @@
           "iframe:focus,[role=button]:focus,[tabindex]:focus{" +
           "outline:4px solid #b6e824!important;outline-offset:4px!important;" +
           "box-shadow:0 0 0 8px rgba(182,232,36,.25)!important}" +
+          "[data-vkplay-tv-pointer-target=true]{" +
+          "outline:4px solid #b6e824!important;outline-offset:4px!important}" +
+          "#vkplay-tizen-tv-cursor{position:fixed;z-index:2147483647;width:28px;" +
+          "height:28px;transform:translate3d(-50%,-50%,0);border:4px solid #fff;" +
+          "border-radius:50%;background:#b6e824;pointer-events:none;" +
+          "box-shadow:0 2px 12px rgba(0,0,0,.9)}" +
+          "#vkplay-tizen-tv-cursor:after{content:'';position:absolute;left:7px;" +
+          "top:7px;width:6px;height:6px;border-radius:50%;background:#10151d}" +
+          "#vkplay-tizen-tv-input-hint{position:fixed;z-index:2147483646;" +
+          "left:50%;bottom:28px;transform:translateX(-50%);max-width:90vw;" +
+          "padding:10px 18px;border-radius:12px;background:rgba(8,12,18,.88);" +
+          "color:#fff;font:20px/1.3 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;" +
+          "white-space:nowrap;pointer-events:none;box-shadow:0 6px 26px rgba(0,0,0,.4)}" +
+          "#vkplay-tizen-tv-input-hint[data-stream=true]{border:2px solid #b6e824}" +
           "#vkplay-tizen-tv-overlay{position:fixed;z-index:2147483647;right:24px;" +
           "top:24px;max-width:620px;padding:12px 16px;border:2px solid #b6e824;" +
           "border-radius:12px;background:rgba(8,12,18,.94);color:#fff;" +
@@ -1114,7 +1400,7 @@
         state.errors.length +
         " · Отчёт: " +
         state.reportStatus +
-        "\nПульт/стик: навигация · A/OK: выбрать · B/Back: назад · Y/синяя: VK ID";
+        "\nДо игры: стик = курсор · В Steam: L1+R1+Options = мышь";
     }
 
     function installOverlay() {
@@ -1299,6 +1585,7 @@
     installOverlay();
     installVkIdNavigation();
     installRemoteNavigation();
+    installVirtualCursor();
     installGamepadMonitor();
     if (isCloudHost) queueReport(2500);
 
