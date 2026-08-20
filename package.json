@@ -1,10 +1,12 @@
 {
-  "name": "tizenbrew-vkplay-diagnostics",
+  "name": "vkplay-tizenbrew-client",
   "version": "0.1.0",
-  "description": "On-device compatibility diagnostics for VK Play Cloud in Samsung TizenBrew",
-  "packageType": "app",
-  "appName": "VK Play Cloud Diagnostics",
-  "appPath": "app/index.html",
+  "description": "Samsung Tizen TV compatibility layer for VK Play Cloud",
+  "packageType": "mods",
+  "appName": "VK Play Cloud TV",
+  "websiteURL": "https://cloud.vkplay.ru/",
+  "main": "mods/inject.js",
+  "evaluateScriptOnDocumentStart": true,
   "keys": [
     "ColorF0Red",
     "ColorF1Green",
