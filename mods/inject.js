@@ -13,7 +13,7 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.7";
+  var VERSION = "0.1.8";
   var REPORT_URL = "http://192.168.0.149:8787/report";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
@@ -75,6 +75,104 @@
   function countSamsungImageAttrs(sdp) {
     var matches = String(sdp || "").match(/^a=imageattr:\d+\s+send\s+/gim);
     return matches ? matches.length : 0;
+  }
+
+  var VK_LAUNCH_MODULE_ID = 10389;
+
+  function isVkLaunchFactory(factory) {
+    if (typeof factory !== "function") return false;
+    if (factory.__vkplayTizenBrowserGate) return true;
+    try {
+      var source = Function.prototype.toString.call(factory);
+      return (
+        source.indexOf("isAvailableWebPlayer") !== -1 &&
+        source.indexOf("isGameUnavailableForWebRTC") !== -1
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function wrapVkLaunchFactory(factory) {
+    if (typeof factory !== "function") return factory;
+    if (factory.__vkplayTizenBrowserGate) return factory;
+
+    function wrappedFactory(moduleObject, moduleExports, requireModule) {
+      function patchedRequire(moduleId) {
+        var original = requireModule(moduleId);
+        if (
+          !original ||
+          typeof original.isAvailableWebPlayer !== "function"
+        ) {
+          return original;
+        }
+
+        var replacement = Object.create(original);
+        Object.defineProperty(replacement, "isAvailableWebPlayer", {
+          configurable: true,
+          enumerable: true,
+          value: function () {
+            return true;
+          }
+        });
+        return replacement;
+      }
+
+      try {
+        Object.setPrototypeOf(patchedRequire, requireModule);
+      } catch (_) {
+        Object.keys(requireModule).forEach(function (key) {
+          try {
+            patchedRequire[key] = requireModule[key];
+          } catch (_) {}
+        });
+      }
+
+      return factory.call(this, moduleObject, moduleExports, patchedRequire);
+    }
+
+    Object.defineProperty(wrappedFactory, "__vkplayTizenBrowserGate", {
+      configurable: false,
+      value: true
+    });
+    return wrappedFactory;
+  }
+
+  function patchVkLaunchFactory(requireModule) {
+    if (typeof requireModule !== "function" || !requireModule.m) {
+      return false;
+    }
+
+    var moduleIds = Object.keys(requireModule.m);
+    if (requireModule.m[VK_LAUNCH_MODULE_ID]) {
+      moduleIds.unshift(String(VK_LAUNCH_MODULE_ID));
+    }
+    for (var index = 0; index < moduleIds.length; index += 1) {
+      var moduleId = moduleIds[index];
+      var factory = requireModule.m[moduleId];
+      if (!isVkLaunchFactory(factory)) continue;
+      requireModule.m[moduleId] = wrapVkLaunchFactory(factory);
+      return !!requireModule.m[moduleId].__vkplayTizenBrowserGate;
+    }
+    return false;
+  }
+
+  function patchVkLaunchChunk(payload) {
+    var modules = payload && payload[1];
+    if (!modules) return false;
+
+    var moduleIds = Object.keys(modules);
+    if (modules[VK_LAUNCH_MODULE_ID]) {
+      moduleIds.unshift(String(VK_LAUNCH_MODULE_ID));
+    }
+    for (var index = 0; index < moduleIds.length; index += 1) {
+      var moduleId = moduleIds[index];
+      var factory = modules[moduleId];
+      if (!isVkLaunchFactory(factory)) continue;
+      modules[moduleId] = wrapVkLaunchFactory(factory);
+      return !!modules[moduleId].__vkplayTizenBrowserGate;
+    }
+    return false;
   }
 
   function install(win) {
@@ -154,6 +252,7 @@
       combinedTracks: 0,
       gamepads: [],
       inputMode: "tv-cursor",
+      vkBrowserGate: "not-installed",
       reportStatus: "not-sent",
       reportError: null,
       errors: []
@@ -265,6 +364,90 @@
         "browser-shim",
         state.browserShim ? "Chrome 120 / Chrome OS" : "partial"
       );
+    }
+
+    function installVkBrowserGate() {
+      var attempts = 0;
+      var factoryPatched = false;
+      var runtimeRequire = null;
+      state.vkBrowserGate = "waiting-for-vk-runtime";
+
+      function markPatched(detail) {
+        if (factoryPatched) return;
+        factoryPatched = true;
+        state.vkBrowserGate = "web-player-enabled";
+        addEvent("vk-browser-gate", detail);
+        queueReport(300);
+      }
+
+      function patchFromWebpack(requireModule) {
+        runtimeRequire = requireModule;
+        try {
+          if (patchVkLaunchFactory(requireModule)) {
+            markPatched("launch module patched");
+          }
+        } catch (error) {
+          recordError("vk-browser-gate", error);
+        }
+      }
+
+      function hookChunkPush(chunks) {
+        if (
+          !chunks ||
+          typeof chunks.push !== "function" ||
+          chunks.push.__vkplayTizenChunkHook
+        ) {
+          return;
+        }
+
+        var originalPush = chunks.push;
+        function hookedPush(payload) {
+          try {
+            if (patchVkLaunchChunk(payload)) {
+              markPatched("launch chunk intercepted");
+            }
+          } catch (error) {
+            recordError("vk-launch-chunk", error);
+          }
+          return originalPush.apply(this, arguments);
+        }
+        Object.defineProperty(hookedPush, "__vkplayTizenChunkHook", {
+          configurable: false,
+          value: true
+        });
+        chunks.push = hookedPush;
+        if (!factoryPatched) state.vkBrowserGate = "launch-hook-ready";
+      }
+
+      function attempt() {
+        attempts += 1;
+        var chunks = win.webpackChunkcg_frontend;
+        hookChunkPush(chunks);
+
+        if (runtimeRequire) patchFromWebpack(runtimeRequire);
+        if (!runtimeRequire && chunks && typeof chunks.push === "function") {
+          try {
+            chunks.push([
+              [920000 + attempts],
+              {},
+              function (requireModule) {
+                patchFromWebpack(requireModule);
+              }
+            ]);
+          } catch (error) {
+            if (attempts === 1) recordError("vk-webpack-runtime", error);
+          }
+        }
+
+        if (!factoryPatched && attempts < 1200) {
+          win.setTimeout(attempt, 500);
+        } else if (!factoryPatched) {
+          state.vkBrowserGate = "vk-launch-module-not-found";
+          addEvent("vk-browser-gate", "VK launch module was not found");
+        }
+      }
+
+      attempt();
     }
 
     function summarizePeers() {
@@ -933,7 +1116,8 @@
       if (!target) return;
       dispatchPointerEvent(target, "pointerup", 0, 0);
       dispatchPointerEvent(target, "mouseup", 0, 0);
-      dispatchPointerEvent(target, "click", 0, 0);
+      if (typeof target.click === "function") target.click();
+      else dispatchPointerEvent(target, "click", 0, 0);
       addEvent("virtual-cursor", "click");
     }
 
@@ -1274,7 +1458,8 @@
       }
 
       function pollGamepadActions() {
-        if (isGameFullscreen()) return;
+        if (hasActiveGameStream()) return;
+        if (isTopLevelContext) return;
         var raw = readGamepads();
         for (var index = 0; index < raw.length; index += 1) {
           var pad = raw[index];
@@ -1399,7 +1584,9 @@
         state.errors.length +
         " · Отчёт: " +
         state.reportStatus +
-        "\nСтик/D-pad: выбор · A: нажать · B: назад · Steam: L1+R1+Options = мышь";
+        "\nVK browser: " +
+        state.vkBrowserGate +
+        "\nДо игры: стик = курсор · Steam: L1+R1+Options = мышь";
     }
 
     function installOverlay() {
@@ -1483,7 +1670,8 @@
             rtcShim: state.rtcShim,
             mediaShim: state.mediaShim,
             fullscreenShim: state.fullscreenShim,
-            imageAttrCount: state.imageAttrCount
+            imageAttrCount: state.imageAttrCount,
+            vkBrowserGate: state.vkBrowserGate
           },
           media: {
             sourceVideoTracks: state.videoTracks,
@@ -1576,6 +1764,7 @@
       return publicApi;
     }
     if (isCloudHost) {
+      installVkBrowserGate();
       installRtcShim();
       installMediaShim();
       installFullscreenShim();
@@ -1584,6 +1773,7 @@
     installOverlay();
     installVkIdNavigation();
     installRemoteNavigation();
+    installVirtualCursor();
     installGamepadMonitor();
     if (isCloudHost) queueReport(2500);
 
@@ -1596,6 +1786,9 @@
     imageAttr: IMAGE_ATTR,
     patchSamsungSdp: patchSamsungSdp,
     countSamsungImageAttrs: countSamsungImageAttrs,
+    wrapVkLaunchFactory: wrapVkLaunchFactory,
+    patchVkLaunchFactory: patchVkLaunchFactory,
+    patchVkLaunchChunk: patchVkLaunchChunk,
     install: install
   };
 });
