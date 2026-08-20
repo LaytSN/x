@@ -13,7 +13,7 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.3";
+  var VERSION = "0.1.4";
   var REPORT_URL = "http://192.168.0.149:8787/report";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
@@ -78,6 +78,23 @@
   }
 
   function install(win) {
+    var currentHostname =
+      win && win.location ? String(win.location.hostname || "").toLowerCase() : "";
+    var isCloudHost = currentHostname === "cloud.vkplay.ru";
+    var isVkAuthHost =
+      currentHostname === "id.vk.com" ||
+      currentHostname === "oauth.vk.com" ||
+      currentHostname === "login.vk.com";
+
+    if (!isCloudHost && !isVkAuthHost) {
+      return {
+        installed: false,
+        skipped: true,
+        version: VERSION,
+        hostname: currentHostname
+      };
+    }
+
     if (win.__VKPLAY_TIZEN__ && win.__VKPLAY_TIZEN__.installed) {
       return win.__VKPLAY_TIZEN__;
     }
