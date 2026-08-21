@@ -13,7 +13,7 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.10";
+  var VERSION = "0.1.11";
   var REPORT_URL = "http://192.168.0.149:8787/report";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
@@ -77,17 +77,12 @@
     return matches ? matches.length : 0;
   }
 
-  function vkMouseComboButtonOverrides(elapsed) {
-    var forced = { 4: false, 5: false, 8: false, 9: false };
-    if (elapsed < 90) {
-      forced[4] = true;
-      forced[5] = true;
-    } else if (elapsed < 210) {
-      forced[4] = true;
-      forced[5] = true;
-      forced[9] = true;
+  function neutralGamepadButtons(buttonCount) {
+    var buttons = [];
+    for (var index = 0; index < buttonCount; index += 1) {
+      buttons.push({ pressed: false, touched: false, value: 0 });
     }
-    return forced;
+    return buttons;
   }
 
   var VK_LAUNCH_MODULE_ID = 10389;
@@ -258,7 +253,7 @@
     var virtualCursorPressTarget = null;
     var streamHintVisible = false;
     var streamMouseMode = false;
-    var vkMouseComboStartedAt = 0;
+    var streamMouseLastWheelAt = 0;
     var vkMouseComboGamepadIndex = -1;
     var vkMouseComboLatched = false;
     var vkMouseComboShimInstalled = false;
@@ -1047,35 +1042,15 @@
       return Boolean(button && (button.pressed || button.value > 0.55));
     }
 
-    function cloneGamepadForVk(pad, forcedButtons) {
-      var buttons = Array.prototype.map.call(pad.buttons || [], function (button) {
-        return {
-          pressed: Boolean(button && button.pressed),
-          touched: Boolean(button && button.touched),
-          value: button ? Number(button.value || 0) : 0
-        };
-      });
-
-      Object.keys(forcedButtons || {}).forEach(function (buttonIndex) {
-        var pressed = Boolean(forcedButtons[buttonIndex]);
-        while (buttons.length <= Number(buttonIndex)) {
-          buttons.push({ pressed: false, touched: false, value: 0 });
-        }
-        buttons[buttonIndex] = {
-          pressed: pressed,
-          touched: pressed,
-          value: pressed ? 1 : 0
-        };
-      });
-
+    function neutralGamepadForVk(pad) {
       return {
         id: pad.id,
         index: pad.index,
         connected: pad.connected,
         mapping: pad.mapping,
         timestamp: pad.timestamp,
-        axes: Array.prototype.slice.call(pad.axes || []),
-        buttons: buttons,
+        axes: Array.prototype.map.call(pad.axes || [], function () { return 0; }),
+        buttons: neutralGamepadButtons((pad.buttons || []).length),
         hand: pad.hand,
         pose: pad.pose,
         vibrationActuator: pad.vibrationActuator,
@@ -1086,17 +1061,17 @@
     function vkGamepadsForPlayer() {
       var raw = readGamepads();
       var output = Array.prototype.slice.call(raw || []);
-      if (!vkMouseComboStartedAt && !vkMouseComboLatched) return output;
+      if (!streamMouseMode && !vkMouseComboLatched) return output;
 
-      var elapsed = vkMouseComboStartedAt
-        ? win.performance.now() - vkMouseComboStartedAt
-        : 9999;
       for (var index = 0; index < output.length; index += 1) {
         var pad = output[index];
-        if (!pad || pad.index !== vkMouseComboGamepadIndex) continue;
-
-        var forced = vkMouseComboButtonOverrides(elapsed);
-        output[index] = cloneGamepadForVk(pad, forced);
+        if (!pad) continue;
+        if (
+          streamMouseMode ||
+          pad.index === vkMouseComboGamepadIndex
+        ) {
+          output[index] = neutralGamepadForVk(pad);
+        }
       }
       return output;
     }
@@ -1109,23 +1084,30 @@
           value: vkGamepadsForPlayer
         });
         vkMouseComboShimInstalled = nav.getGamepads === vkGamepadsForPlayer;
-        state.vkMouseComboShim = vkMouseComboShimInstalled
-          ? "ready"
-          : "unavailable";
       } catch (error) {
-        state.vkMouseComboShim = "error";
-        recordError("vk-mouse-combo-shim", error);
+        try {
+          Object.defineProperty(Object.getPrototypeOf(nav), "getGamepads", {
+            configurable: true,
+            value: vkGamepadsForPlayer
+          });
+          vkMouseComboShimInstalled = nav.getGamepads === vkGamepadsForPlayer;
+        } catch (prototypeError) {
+          recordError("vk-mouse-combo-shim", prototypeError || error);
+        }
       }
+      state.vkMouseComboShim = vkMouseComboShimInstalled
+        ? "ready"
+        : "direct-only";
       addEvent(
         "vk-mouse-combo-shim",
-        vkMouseComboShimInstalled ? "ready" : "unavailable"
+        vkMouseComboShimInstalled ? "ready" : "direct mouse without neutralizer"
       );
     }
 
-    function updateVkMouseCombo(pad, streamActive, timestamp) {
-      if (!pad || !streamActive || !vkMouseComboShimInstalled) {
+    function updateVkMouseCombo(pad, streamActive) {
+      if (!pad || !streamActive) {
         if (!streamActive) {
-          vkMouseComboStartedAt = 0;
+          if (streamMouseMode) stopStreamMouseInput();
           vkMouseComboGamepadIndex = -1;
           vkMouseComboLatched = false;
           streamMouseMode = false;
@@ -1143,22 +1125,18 @@
 
       if (comboPressed && !vkMouseComboLatched) {
         vkMouseComboLatched = true;
-        vkMouseComboStartedAt = timestamp;
         vkMouseComboGamepadIndex = pad.index;
         streamMouseMode = !streamMouseMode;
+        if (!streamMouseMode) stopStreamMouseInput();
         state.streamMouseMode = streamMouseMode;
         state.vkMouseComboCount += 1;
         state.inputMode = streamMouseMode ? "vk-virtual-mouse" : "vk-gamepad";
         addEvent(
           "vk-mouse-combo",
-          streamMouseMode ? "virtual mouse requested" : "gamepad requested"
+          streamMouseMode ? "direct RTC mouse enabled" : "gamepad enabled"
         );
       } else if (!comboPressed && vkMouseComboLatched) {
         vkMouseComboLatched = false;
-      }
-
-      if (vkMouseComboStartedAt && timestamp - vkMouseComboStartedAt >= 300) {
-        vkMouseComboStartedAt = 0;
       }
     }
 
@@ -1293,6 +1271,184 @@
       }
     }
 
+    function createStreamMouseEvent(type, button, buttons, deltaX, deltaY) {
+      var event;
+      var options = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: win,
+        clientX: Math.round(virtualCursorX),
+        clientY: Math.round(virtualCursorY),
+        screenX: Math.round(virtualCursorX),
+        screenY: Math.round(virtualCursorY),
+        button: button == null ? 0 : button,
+        buttons: buttons || 0,
+        movementX: deltaX || 0,
+        movementY: deltaY || 0
+      };
+
+      try {
+        event = new win.MouseEvent(type, options);
+      } catch (_) {
+        event = doc.createEvent("MouseEvent");
+        event.initMouseEvent(
+          type,
+          true,
+          true,
+          win,
+          0,
+          options.screenX,
+          options.screenY,
+          options.clientX,
+          options.clientY,
+          false,
+          false,
+          false,
+          false,
+          options.button,
+          null
+        );
+      }
+
+      try {
+        Object.defineProperty(event, "movementX", {
+          configurable: true,
+          value: deltaX || 0
+        });
+        Object.defineProperty(event, "movementY", {
+          configurable: true,
+          value: deltaY || 0
+        });
+        Object.defineProperty(event, "buttons", {
+          configurable: true,
+          value: buttons || 0
+        });
+      } catch (_) {}
+
+      return event;
+    }
+
+    function dispatchStreamMouseMove(deltaX, deltaY) {
+      if (!deltaX && !deltaY) return;
+      try {
+        win.dispatchEvent(
+          createStreamMouseEvent("mousemove", 0, 0, deltaX, deltaY)
+        );
+        win.dispatchEvent(
+          createStreamMouseEvent("pointerrawupdate", 0, 0, deltaX, deltaY)
+        );
+      } catch (error) {
+        recordError("stream-mouse-move", error);
+      }
+    }
+
+    function dispatchStreamMouseButton(type, button, buttons) {
+      try {
+        win.dispatchEvent(createStreamMouseEvent(type, button, buttons, 0, 0));
+      } catch (error) {
+        recordError("stream-mouse-button", error);
+      }
+    }
+
+    function dispatchStreamMouseWheel(deltaY) {
+      var event;
+      try {
+        if (typeof win.WheelEvent === "function") {
+          event = new win.WheelEvent("wheel", {
+            bubbles: true,
+            cancelable: true,
+            view: win,
+            clientX: Math.round(virtualCursorX),
+            clientY: Math.round(virtualCursorY),
+            deltaY: deltaY,
+            deltaMode: 0
+          });
+        } else {
+          event = doc.createEvent("Event");
+          event.initEvent("wheel", true, true);
+          Object.defineProperty(event, "deltaY", {
+            configurable: true,
+            value: deltaY
+          });
+        }
+        win.dispatchEvent(event);
+      } catch (error) {
+        recordError("stream-mouse-wheel", error);
+      }
+    }
+
+    function stopStreamMouseInput() {
+      var leftPressed = Boolean(virtualCursorButtons[0]);
+      var rightPressed = Boolean(virtualCursorButtons[1]);
+      if (leftPressed) {
+        dispatchStreamMouseButton("mouseup", 0, rightPressed ? 2 : 0);
+      }
+      if (rightPressed) {
+        dispatchStreamMouseButton("mouseup", 2, 0);
+      }
+      virtualCursorButtons = [];
+      virtualCursorPressTarget = null;
+      streamMouseLastWheelAt = 0;
+    }
+
+    function processStreamMouseInput(pad, elapsed, timestamp) {
+      var axisX = normalizedCursorAxis(pad.axes[0]);
+      var axisY = normalizedCursorAxis(pad.axes[1]);
+      var speed = Math.max(
+        900,
+        Math.min(win.innerWidth, win.innerHeight) * 1.25
+      );
+      var deltaX = Math.round(axisX * speed * elapsed / 1000);
+      var deltaY = Math.round(axisY * speed * elapsed / 1000);
+
+      if (deltaX || deltaY) {
+        virtualCursorX = Math.max(
+          0,
+          Math.min(win.innerWidth, virtualCursorX + deltaX)
+        );
+        virtualCursorY = Math.max(
+          0,
+          Math.min(win.innerHeight, virtualCursorY + deltaY)
+        );
+        dispatchStreamMouseMove(deltaX, deltaY);
+      }
+
+      var leftPressed = gamepadButtonPressed(pad.buttons[0]);
+      var rightPressed = gamepadButtonPressed(pad.buttons[1]);
+      var previousLeft = Boolean(virtualCursorButtons[0]);
+      var previousRight = Boolean(virtualCursorButtons[1]);
+      var buttons = (leftPressed ? 1 : 0) | (rightPressed ? 2 : 0);
+
+      if (leftPressed !== previousLeft) {
+        dispatchStreamMouseButton(
+          leftPressed ? "mousedown" : "mouseup",
+          0,
+          buttons
+        );
+      }
+      if (rightPressed !== previousRight) {
+        dispatchStreamMouseButton(
+          rightPressed ? "mousedown" : "mouseup",
+          2,
+          buttons
+        );
+      }
+
+      var scrollAxis = normalizedCursorAxis(pad.axes[3]);
+      if (scrollAxis && timestamp - streamMouseLastWheelAt >= 80) {
+        streamMouseLastWheelAt = timestamp;
+        dispatchStreamMouseWheel(scrollAxis * 34);
+      }
+
+      virtualCursorButtons = Array.prototype.map.call(
+        pad.buttons,
+        function (button) {
+          return gamepadButtonPressed(button);
+        }
+      );
+    }
+
     function normalizedCursorAxis(value) {
       var deadzone = 0.16;
       var absolute = Math.abs(value || 0);
@@ -1306,7 +1462,7 @@
       if (streamActive) {
         virtualCursor.style.display = "none";
         virtualCursorHint.textContent = streamMouseMode
-          ? "МЫШЬ VK: левый стик · × левый клик · ○ правый клик · правый стик прокрутка · L1+R1+Options — геймпад"
+          ? "МЫШЬ TV→VK: левый стик · × левый клик · ○ правый клик · правый стик прокрутка · L1+R1+Options — геймпад"
           : "ГЕЙМПАД VK · L1 + R1 + Options — включить мышь";
         virtualCursorHint.setAttribute("data-stream", "true");
         if (!streamHintVisible) {
@@ -1352,13 +1508,14 @@
         if (!virtualCursor) mount();
         var streamActive = hasActiveGameStream();
         var pad = firstConnectedGamepad();
-        updateVkMouseCombo(pad, streamActive, timestamp);
+        updateVkMouseCombo(pad, streamActive);
         showCursorMode(streamActive);
 
+        var elapsed = virtualCursorLastFrame
+          ? Math.min(50, timestamp - virtualCursorLastFrame)
+          : 16;
+
         if (!streamActive && pad && virtualCursor) {
-          var elapsed = virtualCursorLastFrame
-            ? Math.min(50, timestamp - virtualCursorLastFrame)
-            : 16;
           var axisX = normalizedCursorAxis(pad.axes[0]);
           var axisY = normalizedCursorAxis(pad.axes[1]);
           var speed = Math.max(900, Math.min(win.innerWidth, win.innerHeight) * 1.25);
@@ -1397,9 +1554,10 @@
               return Boolean(button && (button.pressed || button.value > 0.55));
             }
           );
+        } else if (streamActive && streamMouseMode && pad) {
+          processStreamMouseInput(pad, elapsed, timestamp);
         } else if (streamActive) {
-          virtualCursorButtons = [];
-          virtualCursorPressTarget = null;
+          stopStreamMouseInput();
         }
 
         virtualCursorLastFrame = timestamp;
@@ -1748,7 +1906,7 @@
         state.reportStatus +
         "\nVK browser: " +
         state.vkBrowserGate +
-        "\nДо игры: стик = курсор · В игре: L1+R1+Options = мышь VK";
+        "\nДо игры: стик = курсор · В игре: L1+R1+Options = мышь TV→VK";
     }
 
     function installOverlay() {
@@ -1956,7 +2114,7 @@
     imageAttr: IMAGE_ATTR,
     patchSamsungSdp: patchSamsungSdp,
     countSamsungImageAttrs: countSamsungImageAttrs,
-    vkMouseComboButtonOverrides: vkMouseComboButtonOverrides,
+    neutralGamepadButtons: neutralGamepadButtons,
     wrapVkLaunchFactory: wrapVkLaunchFactory,
     patchVkLaunchFactory: patchVkLaunchFactory,
     patchVkLaunchChunk: patchVkLaunchChunk,
