@@ -13,7 +13,7 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.12";
+  var VERSION = "0.1.14";
   var REPORT_URL = "http://192.168.0.149:8787/report";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
@@ -100,6 +100,137 @@
       lastError: null,
       onState: null,
       onError: null
+    };
+  }
+
+  // VK Play регистрирует геймпад ровно один раз — в обработчике события
+  // `gamepadconnected`, и только пока его список входов пуст. Если браузер
+  // выдал это событие до старта игровой сессии (на дашборде), обработчик VK
+  // ещё не навешен, повторного события не будет, и виртуальный геймпад на
+  // сервере не создаётся. Регистратор переиздаёт событие уже внутри сессии
+  // и проверяет успех по тому, начал ли VK опрашивать navigator.getGamepads().
+  function createVkGamepadRegistrar(options) {
+    var config = options || {};
+    var dispatch = typeof config.dispatch === "function" ? config.dispatch : null;
+    var pollCount = typeof config.pollCount === "function" ? config.pollCount : null;
+    var log = typeof config.log === "function" ? config.log : function () {};
+    var startDelayMs = config.startDelayMs || 700;
+    var retryDelayMs = config.retryDelayMs || 600;
+    var probeWindowMs = config.probeWindowMs || 500;
+    var probeThreshold = config.probeThreshold || 10;
+    var maxAnnounces = config.maxAnnounces || 12;
+    var blindAnnounces = config.blindAnnounces || 1;
+
+    var streamWasActive = false;
+    var announcedOnce = false;
+    var status = "idle";
+    var announces = 0;
+    var nextAnnounceAt = 0;
+    var knownIndex = -1;
+    var probeMark = 0;
+    var probeAt = 0;
+    var pollRate = 0;
+
+    function announceLimit() {
+      return pollCount ? maxAnnounces : blindAnnounces;
+    }
+
+    function arm(timestamp, delay) {
+      status = "pending";
+      announces = 0;
+      nextAnnounceAt = timestamp + delay;
+      probeMark = pollCount ? pollCount() : 0;
+      probeAt = timestamp;
+    }
+
+    function idle() {
+      streamWasActive = false;
+      announcedOnce = false;
+      status = "idle";
+      announces = 0;
+      nextAnnounceAt = 0;
+      knownIndex = -1;
+      pollRate = 0;
+    }
+
+    function announce(pad, timestamp) {
+      announces += 1;
+      nextAnnounceAt = timestamp + retryDelayMs;
+      // Повторная регистрация проходит только через пустой список входов VK,
+      // поэтому перед второй и последующими попытками снимаем прежнюю.
+      if ((announces > 1 || announcedOnce) && dispatch) {
+        dispatch("gamepaddisconnected", pad);
+      }
+      if (dispatch) dispatch("gamepadconnected", pad);
+      announcedOnce = true;
+      if (!pollCount) status = "announced";
+      log("announce #" + announces + " for " + ((pad && pad.id) || "gamepad"));
+    }
+
+    function update(pad, streamActive, timestamp) {
+      if (!streamActive) {
+        if (streamWasActive) idle();
+        knownIndex = pad ? pad.index : -1;
+        return status;
+      }
+
+      if (!streamWasActive) {
+        streamWasActive = true;
+        knownIndex = pad ? pad.index : -1;
+        arm(timestamp, startDelayMs);
+      }
+
+      if (!pad) {
+        if (knownIndex !== -1) {
+          knownIndex = -1;
+          arm(timestamp, retryDelayMs);
+          log("gamepad lost inside session");
+        }
+        return status;
+      }
+
+      if (pad.index !== knownIndex) {
+        knownIndex = pad.index;
+        arm(timestamp, 0);
+        log("gamepad reconnected inside session");
+      }
+
+      if (pollCount && timestamp - probeAt >= probeWindowMs) {
+        pollRate = pollCount() - probeMark;
+        probeMark = pollCount();
+        probeAt = timestamp;
+        if (pollRate >= probeThreshold && announces > 0) {
+          if (status !== "ready") {
+            status = "ready";
+            log("registered after " + announces + " announce(s)");
+          }
+          return status;
+        }
+        if (status === "ready") {
+          arm(timestamp, 0);
+          log("VK stopped polling gamepads, re-announcing");
+        }
+      }
+
+      if (status === "ready") return status;
+      if (announces >= announceLimit()) {
+        if (status === "pending") {
+          status = "failed";
+          log("announce limit reached");
+        }
+        return status;
+      }
+      if (timestamp < nextAnnounceAt) return status;
+
+      announce(pad, timestamp);
+      return status;
+    }
+
+    return {
+      update: update,
+      status: function () { return status; },
+      announces: function () { return announces; },
+      pollRate: function () { return pollRate; }
     };
   }
 
@@ -533,6 +664,8 @@
     var vkMouseComboGamepadIndex = -1;
     var vkMouseComboLatched = false;
     var vkMouseComboShimInstalled = false;
+    var vkGamepadPollCount = 0;
+    var vkGamepadRegistrar = null;
     var vkInputBridge = createVkInputBridge();
 
     var state = {
@@ -560,6 +693,9 @@
       vkBrowserGate: "not-installed",
       vkInputTransmitter: "not-installed",
       vkNativeMouseEvents: 0,
+      vkGamepadRegistration: "idle",
+      vkGamepadAnnounces: 0,
+      vkGamepadPollRate: 0,
       reportStatus: "not-sent",
       reportError: null,
       errors: []
@@ -1365,6 +1501,7 @@
     }
 
     function vkGamepadsForPlayer() {
+      vkGamepadPollCount += 1;
       var raw = readGamepads();
       var output = Array.prototype.slice.call(raw || []);
       if (!streamMouseMode && !vkMouseComboLatched) return output;
@@ -1381,6 +1518,45 @@
         }
       }
       return output;
+    }
+
+    function dispatchGamepadLifecycle(type, pad) {
+      if (!pad) return false;
+      var event = null;
+      try {
+        if (typeof win.GamepadEvent === "function") {
+          event = new win.GamepadEvent(type, { gamepad: pad });
+        }
+      } catch (constructorError) {
+        event = null;
+      }
+      if (!event) {
+        try {
+          event = new win.Event(type);
+          Object.defineProperty(event, "gamepad", {
+            configurable: true,
+            value: pad
+          });
+        } catch (fallbackError) {
+          recordError("vk-gamepad-event", fallbackError);
+          return false;
+        }
+      }
+      try {
+        Object.defineProperty(event, "__vkplayTizenSynthetic", {
+          configurable: true,
+          value: true
+        });
+      } catch (markError) {
+        recordError("vk-gamepad-mark", markError);
+      }
+      try {
+        win.dispatchEvent(event);
+        return true;
+      } catch (dispatchError) {
+        recordError("vk-gamepad-dispatch", dispatchError);
+        return false;
+      }
     }
 
     function installVkMouseComboShim() {
@@ -1850,6 +2026,12 @@
         var streamActive = hasActiveGameStream();
         var pad = firstConnectedGamepad();
         updateVkMouseCombo(pad, streamActive);
+        if (vkGamepadRegistrar) {
+          vkGamepadRegistrar.update(pad, streamActive, timestamp);
+          state.vkGamepadRegistration = vkGamepadRegistrar.status();
+          state.vkGamepadAnnounces = vkGamepadRegistrar.announces();
+          state.vkGamepadPollRate = vkGamepadRegistrar.pollRate();
+        }
         showCursorMode(streamActive);
 
         var elapsed = virtualCursorLastFrame
@@ -2150,11 +2332,13 @@
       }
 
       win.addEventListener("gamepadconnected", function (event) {
+        if (event.__vkplayTizenSynthetic) return;
         addEvent("gamepad-connected", event.gamepad.id);
         updateGamepads();
         queueReport(500);
       });
       win.addEventListener("gamepaddisconnected", function (event) {
+        if (event.__vkplayTizenSynthetic) return;
         addEvent("gamepad-disconnected", event.gamepad.id);
         updateGamepads();
       });
@@ -2251,6 +2435,13 @@
         state.vkInputTransmitter +
         " (" +
         state.vkNativeMouseEvents +
+        ")" +
+        "\nVK pad: " +
+        state.vkGamepadRegistration +
+        " (анонсов " +
+        state.vkGamepadAnnounces +
+        ", опрос " +
+        state.vkGamepadPollRate +
         ")" +
         "\nДо игры: стик = курсор · В игре: L1+R1+Options = мышь TV→VK";
     }
@@ -2449,6 +2640,13 @@
     installOverlay();
     installVkIdNavigation();
     installRemoteNavigation();
+    vkGamepadRegistrar = createVkGamepadRegistrar({
+      dispatch: dispatchGamepadLifecycle,
+      pollCount: vkMouseComboShimInstalled
+        ? function () { return vkGamepadPollCount; }
+        : null,
+      log: function (message) { addEvent("vk-gamepad", message); }
+    });
     installVirtualCursor();
     installGamepadMonitor();
     if (isCloudHost) queueReport(2500);
@@ -2467,6 +2665,7 @@
     patchVkLaunchFactory: patchVkLaunchFactory,
     patchVkLaunchChunk: patchVkLaunchChunk,
     createVkInputBridge: createVkInputBridge,
+    createVkGamepadRegistrar: createVkGamepadRegistrar,
     wrapVkInputFactory: wrapVkInputFactory,
     patchVkInputFactory: patchVkInputFactory,
     patchVkInputChunk: patchVkInputChunk,
