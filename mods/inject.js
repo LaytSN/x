@@ -13,8 +13,8 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.14";
-  var REPORT_URL = "http://192.168.0.149:8787/report";
+  var VERSION = "0.1.15";
+  var REPORT_URL = "http://192.168.0.219:8787/report";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
     "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) " +
@@ -115,11 +115,10 @@
     var pollCount = typeof config.pollCount === "function" ? config.pollCount : null;
     var log = typeof config.log === "function" ? config.log : function () {};
     var startDelayMs = config.startDelayMs || 700;
-    var retryDelayMs = config.retryDelayMs || 600;
     var probeWindowMs = config.probeWindowMs || 500;
-    var probeThreshold = config.probeThreshold || 10;
-    var maxAnnounces = config.maxAnnounces || 12;
-    var blindAnnounces = config.blindAnnounces || 1;
+    var retryDelayMs = config.retryDelayMs || 1500;
+    var maxAnnounces = config.maxAnnounces || 3;
+    var probeTimeoutMs = config.probeTimeoutMs || 4000;
 
     var streamWasActive = false;
     var announcedOnce = false;
@@ -130,14 +129,13 @@
     var probeMark = 0;
     var probeAt = 0;
     var pollRate = 0;
-
-    function announceLimit() {
-      return pollCount ? maxAnnounces : blindAnnounces;
-    }
+    var lastPad = null;
+    var announcedAt = 0;
 
     function arm(timestamp, delay) {
       status = "pending";
       announces = 0;
+      announcedOnce = false;
       nextAnnounceAt = timestamp + delay;
       probeMark = pollCount ? pollCount() : 0;
       probeAt = timestamp;
@@ -151,18 +149,17 @@
       nextAnnounceAt = 0;
       knownIndex = -1;
       pollRate = 0;
+      lastPad = null;
+      announcedAt = 0;
     }
 
     function announce(pad, timestamp) {
       announces += 1;
-      nextAnnounceAt = timestamp + retryDelayMs;
-      // Повторная регистрация проходит только через пустой список входов VK,
-      // поэтому перед второй и последующими попытками снимаем прежнюю.
-      if ((announces > 1 || announcedOnce) && dispatch) {
-        dispatch("gamepaddisconnected", pad);
-      }
       if (dispatch) dispatch("gamepadconnected", pad);
       announcedOnce = true;
+      lastPad = pad;
+      announcedAt = timestamp;
+      nextAnnounceAt = timestamp + retryDelayMs;
       if (!pollCount) status = "announced";
       log("announce #" + announces + " for " + ((pad && pad.id) || "gamepad"));
     }
@@ -182,16 +179,23 @@
 
       if (!pad) {
         if (knownIndex !== -1) {
+          if (announcedOnce && dispatch && lastPad) {
+            dispatch("gamepaddisconnected", lastPad);
+          }
           knownIndex = -1;
-          arm(timestamp, retryDelayMs);
+          announcedOnce = false;
+          arm(timestamp, startDelayMs);
           log("gamepad lost inside session");
         }
         return status;
       }
 
       if (pad.index !== knownIndex) {
+        if (lastPad && announcedOnce && dispatch) {
+          dispatch("gamepaddisconnected", lastPad);
+        }
         knownIndex = pad.index;
-        arm(timestamp, 0);
+        arm(timestamp, startDelayMs);
         log("gamepad reconnected inside session");
       }
 
@@ -199,30 +203,28 @@
         pollRate = pollCount() - probeMark;
         probeMark = pollCount();
         probeAt = timestamp;
-        if (pollRate >= probeThreshold && announces > 0) {
+        if (pollRate > 0 && announces > 0) {
           if (status !== "ready") {
             status = "ready";
             log("registered after " + announces + " announce(s)");
           }
           return status;
         }
-        if (status === "ready") {
-          arm(timestamp, 0);
-          log("VK stopped polling gamepads, re-announcing");
-        }
+        // A slow/stalled rAF is not a physical disconnect. Never reset a
+        // registered controller merely because the main thread is busy.
       }
 
       if (status === "ready") return status;
-      if (announces >= announceLimit()) {
-        if (status === "pending") {
-          status = "failed";
-          log("announce limit reached");
-        }
+      if (!pollCount && announcedOnce) return status;
+      if (status === "failed") return status;
+      if (announces >= maxAnnounces && timestamp - announcedAt >= probeTimeoutMs) {
+        status = "failed";
+        log("VK did not start gamepad polling; startup attempts exhausted");
         return status;
       }
       if (timestamp < nextAnnounceAt) return status;
 
-      announce(pad, timestamp);
+      if (announces < maxAnnounces) announce(pad, timestamp);
       return status;
     }
 
@@ -644,6 +646,8 @@
     var peerConnections = [];
     var recentEvents = [];
     var reportTimer = 0;
+    var reportInFlight = null;
+    var nextAutomaticReportAt = 0;
     var overlay = null;
     var overlayDetails = null;
     var overlayVisible = false;
@@ -659,7 +663,10 @@
     var virtualCursorButtons = [];
     var virtualCursorPressTarget = null;
     var streamHintVisible = false;
+    var lastStreamHintText = "";
+    var lastStreamHintMode = "";
     var streamMouseMode = false;
+    var streamMouseInputActive = false;
     var streamMouseLastWheelAt = 0;
     var vkMouseComboGamepadIndex = -1;
     var vkMouseComboLatched = false;
@@ -696,30 +703,68 @@
       vkGamepadRegistration: "idle",
       vkGamepadAnnounces: 0,
       vkGamepadPollRate: 0,
+      diagnostics: {
+        trace: [],
+        history: [],
+        shell: {
+          fps: 0,
+          averageFrameMs: 0,
+          maxFrameMs: 0,
+          longFrames: 0,
+          sampledAt: null
+        },
+        video: {
+          event: "not-seen",
+          intrinsic: "unknown",
+          layout: "unknown",
+          objectFit: "unknown",
+          readyState: -1,
+          paused: null,
+          totalFrames: null,
+          droppedFrames: null,
+          sampledAt: null
+        }
+      },
       reportStatus: "not-sent",
       reportError: null,
       errors: []
     };
 
-    function addEvent(type, detail) {
+    function traceEvent(type, detail) {
       var entry = {
         at: new Date().toISOString(),
         type: type,
-        detail: detail == null ? "" : String(detail)
+        detail: detail == null ? "" : String(detail).slice(0, 512)
       };
       recentEvents.push(entry);
       if (recentEvents.length > 60) recentEvents.shift();
+      state.diagnostics.trace.push(entry);
+      if (state.diagnostics.trace.length > 160) {
+        state.diagnostics.trace.shift();
+      }
       try {
-        win.console.info("[VK TV] " + type, detail == null ? "" : detail);
+        win.console.info("[VK TV] " + type, entry.detail);
       } catch (_) {}
+      return entry;
+    }
+
+    function addEvent(type, detail) {
+      traceEvent(type, detail);
       renderOverlay();
     }
 
     function recordError(scope, error) {
+      var message = errorText(error);
+      var previous = state.errors[state.errors.length - 1];
+      if (previous && previous.scope === scope && previous.error === message &&
+          Date.now() - Date.parse(previous.at) < 5000) {
+        previous.repeats = (previous.repeats || 1) + 1;
+        return;
+      }
       var entry = {
         at: new Date().toISOString(),
         scope: scope,
-        error: errorText(error)
+        error: message.slice(0, 512)
       };
       state.errors.push(entry);
       if (state.errors.length > 30) state.errors.shift();
@@ -1042,6 +1087,14 @@
       var combinedStream = null;
       var audioMuted = true;
       var watchedStreams = [];
+      var videoDiagnosticsTimer = 0;
+      var monitoredVideo = null;
+      var videoHandlers = {};
+      var videoQualityUnavailable = false;
+      var lastVideoSignature = "";
+      var lastVideoTotalFrames = null;
+      var lastVideoDroppedFrames = null;
+      var lastVideoSampleAt = null;
 
       function isVkAudio(element) {
         return (
@@ -1074,6 +1127,105 @@
         state.combinedTracks = combinedStream ? combinedStream.getTracks().length : 0;
       }
 
+      function sampleVideoDiagnostics(reason, emitTrace) {
+        try { readVideoDiagnostics(reason, emitTrace); }
+        catch (error) { recordError("video-diagnostics", error); }
+      }
+
+      function readVideoDiagnostics(reason, emitTrace) {
+        if (!videoElement) return;
+        var rect = videoElement.getBoundingClientRect();
+        var style = win.getComputedStyle(videoElement);
+        var quality = null;
+        if (!videoQualityUnavailable && typeof videoElement.getVideoPlaybackQuality === "function") {
+          try { quality = videoElement.getVideoPlaybackQuality(); }
+          catch (_) {
+            videoQualityUnavailable = true;
+            traceEvent("video-quality", "unavailable; continuing playback");
+          }
+        }
+        var totalFrames = quality && typeof quality.totalVideoFrames === "number" ? quality.totalVideoFrames : null;
+        var droppedFrames = quality && typeof quality.droppedVideoFrames === "number" ? quality.droppedVideoFrames : null;
+        var now = Date.now();
+        var sample = {
+          event: reason || "sample",
+          intrinsic:
+            String(videoElement.videoWidth || 0) + "x" +
+            String(videoElement.videoHeight || 0),
+          layout:
+            Math.round(rect.width) + "x" + Math.round(rect.height) +
+            " @" + Math.round(rect.left) + "," + Math.round(rect.top),
+          objectFit: style.objectFit || "default",
+          position: style.position,
+          transform: style.transform,
+          cssWidth: style.width,
+          cssHeight: style.height,
+          viewport: { width: win.innerWidth, height: win.innerHeight },
+          readyState: videoElement.readyState,
+          paused: videoElement.paused,
+          networkState: videoElement.networkState,
+          totalFrames: totalFrames,
+          droppedFrames: droppedFrames,
+          framesSinceLast:
+            totalFrames == null || lastVideoTotalFrames == null ? null : Math.max(0, totalFrames - lastVideoTotalFrames),
+          droppedSinceLast:
+            droppedFrames == null || lastVideoDroppedFrames == null
+              ? null
+              : Math.max(0, droppedFrames - lastVideoDroppedFrames),
+          intervalMs: lastVideoSampleAt == null ? null : now - lastVideoSampleAt,
+          sampledAt: new Date(now).toISOString()
+        };
+        state.diagnostics.video = sample;
+        if (totalFrames != null) lastVideoTotalFrames = totalFrames;
+        if (droppedFrames != null) lastVideoDroppedFrames = droppedFrames;
+        lastVideoSampleAt = now;
+
+        var signature = [
+          sample.intrinsic,
+          sample.layout,
+          sample.objectFit,
+          sample.readyState,
+          sample.paused
+        ].join("|");
+        if (emitTrace || signature !== lastVideoSignature) {
+          lastVideoSignature = signature;
+          traceEvent(
+            "video-" + sample.event,
+            sample.intrinsic + " → " + sample.layout +
+              " fit=" + sample.objectFit +
+              " rs=" + sample.readyState +
+              " frames=" + (sample.framesSinceLast == null ? "?" : sample.framesSinceLast) +
+              " dropped=" + (sample.droppedSinceLast == null ? "?" : sample.droppedSinceLast)
+          );
+        }
+      }
+
+      function installVideoDiagnostics() {
+        if (!videoElement || monitoredVideo === videoElement) return;
+        if (monitoredVideo) {
+          Object.keys(videoHandlers).forEach(function (name) {
+            monitoredVideo.removeEventListener(name, videoHandlers[name]);
+          });
+        }
+        monitoredVideo = videoElement;
+        lastVideoTotalFrames = lastVideoDroppedFrames = lastVideoSampleAt = null;
+        videoQualityUnavailable = false;
+        ["loadedmetadata", "resize", "playing", "waiting", "stalled", "suspend", "error"].forEach(
+          function (eventName) {
+            videoHandlers[eventName] = function () {
+              sampleVideoDiagnostics(eventName, true);
+            };
+            videoElement.addEventListener(eventName, videoHandlers[eventName]);
+          }
+        );
+        if (!videoDiagnosticsTimer) {
+          videoDiagnosticsTimer = win.setInterval(function () {
+            if (!doc.hidden && videoElement && videoElement.isConnected) sampleVideoDiagnostics("sample", false);
+          }, 1000);
+        }
+        sampleVideoDiagnostics("element-created", true);
+      }
+
       function rebuildCombinedStream() {
         if (!videoElement || !videoStream) {
           updateTrackState();
@@ -1088,6 +1240,7 @@
 
         combinedStream = new win.MediaStream(tracks);
         nativeSet(videoElement, combinedStream);
+        installVideoDiagnostics();
         setNativeMuted(videoElement, tracks.length > 1 ? audioMuted : true);
         videoElement.setAttribute("playsinline", "");
         videoElement.setAttribute("disablepictureinpicture", "");
@@ -1101,6 +1254,7 @@
         }
 
         updateTrackState();
+        sampleVideoDiagnostics("stream-rebuilt", true);
         addEvent(
           "media-combined",
           state.videoTracks + " video + " + state.audioTracks + " audio"
@@ -1367,8 +1521,10 @@
 
     function installVkIdNavigation() {
       function scan() {
+        if (hasActiveGameStream()) return;
         win.clearTimeout(authScanTimer);
         authScanTimer = win.setTimeout(function () {
+          if (hasActiveGameStream()) return;
           var actions = prepareVkIdActions().concat(prepareVkIdFrames());
           if (
             actions.length &&
@@ -1591,6 +1747,7 @@
       if (!pad || !streamActive) {
         if (!streamActive) {
           if (streamMouseMode) stopStreamMouseInput();
+          streamMouseInputActive = false;
           vkMouseComboGamepadIndex = -1;
           vkMouseComboLatched = false;
           streamMouseMode = false;
@@ -1975,23 +2132,41 @@
     function showCursorMode(streamActive) {
       if (!virtualCursor || !virtualCursorHint) return;
       if (streamActive) {
-        virtualCursor.style.display = "none";
-        virtualCursorHint.textContent = streamMouseMode
+        if (virtualCursor.style.display !== "none") {
+          virtualCursor.style.display = "none";
+        }
+        var streamHint = streamMouseMode
           ? "МЫШЬ VK: левый стик · × левый клик · ○ правый клик · правый стик прокрутка · родной канал: " +
             (vkInputBridge.token == null ? "подключается" : "готов") +
             " · L1+R1+Options — геймпад"
           : "ГЕЙМПАД VK · L1 + R1 + Options — включить мышь";
-        virtualCursorHint.setAttribute("data-stream", "true");
+        if (lastStreamHintText !== streamHint) {
+          lastStreamHintText = streamHint;
+          virtualCursorHint.textContent = streamHint;
+        }
+        if (lastStreamHintMode !== "stream") {
+          lastStreamHintMode = "stream";
+          virtualCursorHint.setAttribute("data-stream", "true");
+        }
         if (!streamHintVisible) {
           streamHintVisible = true;
           state.inputMode = "vk-stream";
           addEvent("input-mode", "VK stream; L1+R1+Options toggles virtual mouse");
         }
       } else {
-        virtualCursor.style.display = "block";
-        virtualCursorHint.textContent =
+        if (virtualCursor.style.display !== "block") {
+          virtualCursor.style.display = "block";
+        }
+        var dashboardHint =
           "Стик: курсор · ×: нажать · правый стик: прокрутка · ○: назад";
-        virtualCursorHint.setAttribute("data-stream", "false");
+        if (lastStreamHintText !== dashboardHint) {
+          lastStreamHintText = dashboardHint;
+          virtualCursorHint.textContent = dashboardHint;
+        }
+        if (lastStreamHintMode !== "dashboard") {
+          lastStreamHintMode = "dashboard";
+          virtualCursorHint.setAttribute("data-stream", "false");
+        }
         if (streamHintVisible) {
           streamHintVisible = false;
           state.inputMode = "tv-cursor";
@@ -2002,6 +2177,33 @@
 
     function installVirtualCursor() {
       if (!isTopLevelContext) return;
+      var shellSampleStartedAt = 0;
+      var shellFrames = 0;
+      var shellFrameTotal = 0;
+      var shellFrameMax = 0;
+      var shellLongFrames = 0;
+
+      function sampleShellPerformance(timestamp, elapsed) {
+        if (!shellSampleStartedAt) shellSampleStartedAt = timestamp;
+        shellFrames += 1;
+        shellFrameTotal += elapsed;
+        shellFrameMax = Math.max(shellFrameMax, elapsed);
+        if (elapsed > 34) shellLongFrames += 1;
+        if (timestamp - shellSampleStartedAt < 1000) return;
+
+        state.diagnostics.shell = {
+          fps: Math.round(shellFrames * 1000 / (timestamp - shellSampleStartedAt)),
+          averageFrameMs: Math.round(shellFrameTotal / shellFrames * 10) / 10,
+          maxFrameMs: Math.round(shellFrameMax * 10) / 10,
+          longFrames: shellLongFrames,
+          sampledAt: new Date().toISOString()
+        };
+        shellSampleStartedAt = timestamp;
+        shellFrames = 0;
+        shellFrameTotal = 0;
+        shellFrameMax = 0;
+        shellLongFrames = 0;
+      }
 
       function mount() {
         if (!doc.body || virtualCursor) return;
@@ -2024,6 +2226,11 @@
       function frame(timestamp) {
         if (!virtualCursor) mount();
         var streamActive = hasActiveGameStream();
+        var elapsed = virtualCursorLastFrame
+          ? timestamp - virtualCursorLastFrame
+          : 16;
+        sampleShellPerformance(timestamp, elapsed);
+
         var pad = firstConnectedGamepad();
         updateVkMouseCombo(pad, streamActive);
         if (vkGamepadRegistrar) {
@@ -2034,9 +2241,7 @@
         }
         showCursorMode(streamActive);
 
-        var elapsed = virtualCursorLastFrame
-          ? Math.min(50, timestamp - virtualCursorLastFrame)
-          : 16;
+        elapsed = Math.min(50, elapsed);
 
         if (!streamActive && pad && virtualCursor) {
           var axisX = normalizedCursorAxis(pad.axes[0]);
@@ -2078,9 +2283,11 @@
             }
           );
         } else if (streamActive && streamMouseMode && pad) {
+          streamMouseInputActive = true;
           processStreamMouseInput(pad, elapsed, timestamp);
-        } else if (streamActive) {
+        } else if (streamActive && streamMouseInputActive) {
           stopStreamMouseInput();
+          streamMouseInputActive = false;
         }
 
         virtualCursorLastFrame = timestamp;
@@ -2443,6 +2650,20 @@
         ", опрос " +
         state.vkGamepadPollRate +
         ")" +
+        "\nВидео: " +
+        state.diagnostics.video.intrinsic +
+        " → " +
+        state.diagnostics.video.layout +
+        " · drop " +
+        (state.diagnostics.video.droppedSinceLast == null
+          ? "?"
+          : state.diagnostics.video.droppedSinceLast) +
+        "\nОболочка: " +
+        state.diagnostics.shell.fps +
+        " fps · avg " +
+        state.diagnostics.shell.averageFrameMs +
+        " ms · long " +
+        state.diagnostics.shell.longFrames +
         "\nДо игры: стик = курсор · В игре: L1+R1+Options = мышь TV→VK";
     }
 
@@ -2460,35 +2681,50 @@
     function collectStats() {
       return Promise.all(
         peerConnections.map(function (pc, index) {
-          if (!pc.getStats) return Promise.resolve({ index: index, stats: [] });
-          return pc
-            .getStats()
+          if (!pc.getStats || pc.connectionState === "closed") return Promise.resolve({ index: index, stats: [] });
+          return Promise.resolve().then(function () { return pc.getStats(); })
             .then(function (report) {
               var stats = [];
               report.forEach(function (item) {
                 if (
                   item.type === "inbound-rtp" ||
                   item.type === "candidate-pair" ||
-                  item.type === "transport"
+                  item.type === "transport" ||
+                  item.type === "codec" ||
+                  item.type === "data-channel"
                 ) {
                   stats.push({
                     id: item.id,
                     type: item.type,
+                    timestamp: item.timestamp,
                     kind: item.kind || item.mediaType,
+                    codecId: item.codecId,
+                    mimeType: item.mimeType,
+                    clockRate: item.clockRate,
+                    decoderImplementation: item.decoderImplementation,
+                    powerEfficientDecoder: item.powerEfficientDecoder,
                     state: item.state,
                     nominated: item.nominated,
+                    selectedCandidatePairId: item.selectedCandidatePairId,
                     bytesReceived: item.bytesReceived,
                     packetsReceived: item.packetsReceived,
                     packetsLost: item.packetsLost,
                     jitter: item.jitter,
                     framesDecoded: item.framesDecoded,
                     framesDropped: item.framesDropped,
+                    freezeCount: item.freezeCount,
+                    totalFreezesDuration: item.totalFreezesDuration,
                     framesPerSecond: item.framesPerSecond,
                     frameWidth: item.frameWidth,
                     frameHeight: item.frameHeight,
                     totalDecodeTime: item.totalDecodeTime,
                     jitterBufferDelay: item.jitterBufferDelay,
                     jitterBufferEmittedCount: item.jitterBufferEmittedCount,
+                    messagesSent: item.messagesSent,
+                    messagesReceived: item.messagesReceived,
+                    bytesSent: item.bytesSent,
+                    concealedSamples: item.concealedSamples,
+                    totalSamplesReceived: item.totalSamplesReceived,
                     currentRoundTripTime: item.currentRoundTripTime,
                     availableIncomingBitrate: item.availableIncomingBitrate
                   });
@@ -2503,12 +2739,40 @@
       );
     }
 
+    function installDiagnosticsSampler() {
+      if (!isTopLevelContext || !isCloudHost) return;
+      var pending = false;
+      win.setInterval(function () {
+        if (pending || doc.hidden) return;
+        pending = true;
+        collectStats().then(function (stats) {
+          state.diagnostics.history.push({
+            at: new Date().toISOString(),
+            shell: Object.assign({}, state.diagnostics.shell),
+            video: Object.assign({}, state.diagnostics.video),
+            inputMode: streamMouseMode ? "mouse" : "gamepad",
+            registration: state.vkGamepadRegistration,
+            announces: state.vkGamepadAnnounces,
+            vkPolls: vkGamepadPollCount,
+            mouseEvents: vkInputBridge.sentEvents,
+            rtcStats: stats
+          });
+          if (state.diagnostics.history.length > 60) state.diagnostics.history.shift();
+          pending = false;
+        }, function (error) {
+          pending = false;
+          recordError("stats-sampler", error);
+        });
+      }, 2000);
+    }
+
     function buildReport(reason) {
       summarizePeers();
       updateGamepads();
       return collectStats().then(function (rtcStats) {
         return {
           schema: "vkplay-tizen-live/1",
+          version: VERSION,
           generatedAt: new Date().toISOString(),
           reason: reason,
           device: {
@@ -2517,6 +2781,11 @@
             effectiveUserAgent: nav.userAgent,
             screen: win.screen.width + "x" + win.screen.height,
             devicePixelRatio: win.devicePixelRatio
+          },
+          viewport: {
+            width: win.innerWidth,
+            height: win.innerHeight,
+            fullscreen: Boolean(doc.fullscreenElement || doc.webkitFullscreenElement)
           },
           page: {
             origin: win.location.origin,
@@ -2537,6 +2806,14 @@
             sourceAudioTracks: state.audioTracks,
             combinedTracks: state.combinedTracks
           },
+          diagnostics: state.diagnostics,
+          input: {
+            mode: streamMouseMode ? "mouse" : "gamepad",
+            registration: state.vkGamepadRegistration,
+            announces: state.vkGamepadAnnounces,
+            pollCount: vkGamepadPollCount,
+            switches: state.vkMouseComboCount
+          },
           gamepads: state.gamepads,
           peers: state.peerStates,
           rtcStats: rtcStats,
@@ -2547,10 +2824,13 @@
     }
 
     function sendReport(reason) {
+      if (reportInFlight) return reportInFlight;
+      if (reason === "automatic" && Date.now() < nextAutomaticReportAt) return Promise.resolve(null);
+      nextAutomaticReportAt = Date.now() + 15000;
       state.reportStatus = "sending";
       state.reportError = null;
       renderOverlay();
-      return buildReport(reason || "manual")
+      reportInFlight = buildReport(reason || "manual")
         .then(function (report) {
           var controller = win.AbortController ? new win.AbortController() : null;
           var timeout = win.setTimeout(function () {
@@ -2582,7 +2862,11 @@
           state.reportError = errorText(error);
           addEvent("report-failed", state.reportError);
           return null;
+        }).then(function (result) {
+          reportInFlight = null;
+          return result;
         });
+      return reportInFlight;
     }
 
     function queueReport(delay) {
@@ -2649,6 +2933,7 @@
     });
     installVirtualCursor();
     installGamepadMonitor();
+    installDiagnosticsSampler();
     if (isCloudHost) queueReport(2500);
 
     addEvent("installed", VERSION);
