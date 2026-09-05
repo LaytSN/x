@@ -13,7 +13,7 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.15";
+  var VERSION = "0.1.16";
   var REPORT_URL = "http://192.168.0.219:8787/report";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
@@ -30,7 +30,7 @@
     return String(error);
   }
 
-  function patchSamsungSdp(sdp) {
+  function patchSamsungSdp(sdp, profile) {
     if (typeof sdp !== "string" || sdp.indexOf("m=video") === -1) {
       return sdp;
     }
@@ -64,7 +64,9 @@
 
       var h264 = line.match(/^a=rtpmap:(\d+)\s+H264\/90000(?:\s|$)/i);
       if (h264 && !imageAttrPayloads[h264[1]]) {
-        output.push("a=imageattr:" + h264[1] + " " + IMAGE_ATTR);
+        var imageAttr = profile === "1440p"
+          ? "send [x=[960:2560],y=[540:1440],fps=[60:60]]" : IMAGE_ATTR;
+        output.push("a=imageattr:" + h264[1] + " " + imageAttr);
         imageAttrPayloads[h264[1]] = true;
       }
     }
@@ -75,6 +77,47 @@
   function countSamsungImageAttrs(sdp) {
     var matches = String(sdp || "").match(/^a=imageattr:\d+\s+send\s+/gim);
     return matches ? matches.length : 0;
+  }
+
+  function summarizeStreamMetrics(current, previous) {
+    var result = { decodedFps: null, bitrateMbps: null, decodeMs: null,
+      jitterBufferMs: null, lossPercent: null, rttMs: null, resolution: "unknown", codec: "unknown" };
+    var peer = null, video = null;
+    (current || []).forEach(function (candidate) {
+      (candidate.stats || []).forEach(function (item) {
+        if (item.type === "inbound-rtp" && item.kind === "video") { peer = candidate; video = item; }
+      });
+    });
+    if (!video) return result;
+    var old = null;
+    (previous || []).forEach(function (candidate) {
+      if (candidate.index !== peer.index) return;
+      (candidate.stats || []).forEach(function (item) { if (item.id === video.id) old = item; });
+    });
+    function number(value) { return typeof value === "number" && isFinite(value); }
+    function delta(key) {
+      return old && number(old[key]) && number(video[key]) && video[key] >= old[key] ? video[key] - old[key] : null;
+    }
+    function round(value) { return Math.round(value * 100) / 100; }
+    var elapsed = old && number(video.timestamp) && number(old.timestamp) ? video.timestamp - old.timestamp : 0;
+    var frames = delta("framesDecoded"), bytes = delta("bytesReceived");
+    var decode = delta("totalDecodeTime"), buffer = delta("jitterBufferDelay"), emitted = delta("jitterBufferEmittedCount");
+    var received = delta("packetsReceived"), lost = delta("packetsLost");
+    if (elapsed > 0 && frames != null) result.decodedFps = round(frames * 1000 / elapsed);
+    if (elapsed > 0 && bytes != null) result.bitrateMbps = round(bytes * 8 / elapsed / 1000);
+    if (frames > 0 && decode != null) result.decodeMs = round(decode * 1000 / frames);
+    if (emitted > 0 && buffer != null) result.jitterBufferMs = round(buffer * 1000 / emitted);
+    if (lost != null && received != null && received + lost > 0) result.lossPercent = round(lost * 100 / (received + lost));
+    if (video.frameWidth && video.frameHeight) result.resolution = video.frameWidth + "x" + video.frameHeight;
+    var selected = null;
+    peer.stats.forEach(function (item) {
+      if (item.id === video.codecId) result.codec = item.mimeType || "unknown";
+      if (item.type === "transport" && item.selectedCandidatePairId) selected = item.selectedCandidatePairId;
+    });
+    peer.stats.forEach(function (item) {
+      if (item.type === "candidate-pair" && item.id === selected && number(item.currentRoundTripTime)) result.rttMs = round(item.currentRoundTripTime * 1000);
+    });
+    return result;
   }
 
   function neutralGamepadButtons(buttonCount) {
@@ -641,6 +684,8 @@
     var doc = win.document;
     var nav = win.navigator;
     var realUserAgent = nav.userAgent;
+    var realScreen = { width: win.screen.width, height: win.screen.height, devicePixelRatio: win.devicePixelRatio || 1 };
+    var qualityProfile = "1080p";
     var nativeGetGamepads =
       typeof nav.getGamepads === "function" ? nav.getGamepads.bind(nav) : null;
     var peerConnections = [];
@@ -670,6 +715,7 @@
     var streamMouseLastWheelAt = 0;
     var vkMouseComboGamepadIndex = -1;
     var vkMouseComboLatched = false;
+    var streamMenuComboLatched = false;
     var vkMouseComboShimInstalled = false;
     var vkGamepadPollCount = 0;
     var vkGamepadRegistrar = null;
@@ -680,6 +726,7 @@
       version: VERSION,
       startedAt: new Date().toISOString(),
       targetModel: TARGET_MODEL,
+      quality: { active: "1080p", next: "1080p", experimental: false, screenOverride: false },
       realUserAgent: realUserAgent,
       spoofedUserAgent: SPOOFED_UA,
       browserShim: false,
@@ -695,6 +742,7 @@
       gamepads: [],
       inputMode: "tv-cursor",
       streamMouseMode: false,
+      streamMenuOpen: false,
       vkMouseComboCount: 0,
       vkMouseComboShim: "not-installed",
       vkBrowserGate: "not-installed",
@@ -706,6 +754,10 @@
       diagnostics: {
         trace: [],
         history: [],
+        network: [],
+        stream: summarizeStreamMetrics([], []),
+        display: { hdrSupported: null, hdrActive: "unknown", gameModeActive: "unknown", realScreen: realScreen },
+        previousRun: null,
         shell: {
           fps: 0,
           averageFrameMs: 0,
@@ -806,6 +858,68 @@
           return false;
         }
       }
+    }
+
+    function configureStreamQuality() {
+      if (!/Tizen/i.test(realUserAgent)) return;
+      var display = state.diagnostics.display;
+      var uhd = null;
+      try { uhd = win.webapis.productinfo.isUdPanelSupported(); } catch (_) {}
+      try { display.hdrSupported = win.webapis.avinfo.isHdrTvSupport(); } catch (_) {}
+      display.uhdSupported = uhd;
+      // The module targets the user-specified UHD UE55U8000FUXCE. If the TV
+      // explicitly reports no UHD support, retain the known FHD envelope.
+      display.panelBasis = uhd == null ? "user-specified-UE55U8000FUXCE" : "productinfo";
+      try {
+        var stored = win.localStorage.getItem("VKPLAY_TV_QUALITY");
+        qualityProfile = stored === "1080p" || uhd === false ? "1080p" : "1440p";
+        if (win.localStorage.getItem("VKPLAY_TV_QUALITY_APPLIED") !== qualityProfile) {
+          // These enums are from VK's official web player Ml.loadConfig / Li / Qi.
+          // Apply once per selection; later edits in VK's own configurator survive.
+          win.localStorage.setItem("WEB_PLAYER_VIDEO_RESOLUTION", qualityProfile === "1440p" ? "7" : "5");
+          win.localStorage.setItem("WEB_PLAYER_VIDEO_FPS", "3");
+          win.localStorage.setItem("WEB_PLAYER_VIDEO_QUALITY_PRESET", "4");
+          win.localStorage.setItem("VKPLAY_TV_QUALITY_APPLIED", qualityProfile);
+        }
+      } catch (error) {
+        qualityProfile = "1080p";
+        recordError("stream-quality", error);
+      }
+      state.quality.active = state.quality.next = qualityProfile;
+      state.quality.experimental = qualityProfile === "1440p";
+      // VK mistakes Tizen's logical 1080p browser screen for the UHD panel
+      // and applies it as a hardware stream limit. Keep the real CSS viewport
+      // and pointer coordinates; expose only the selected decode envelope.
+      var width = qualityProfile === "1440p" ? 2560 : 1920;
+      var height = qualityProfile === "1440p" ? 1440 : 1080;
+      var values = { width: width, availWidth: width, height: height, availHeight: height };
+      var descriptors = {};
+      try {
+        Object.keys(values).forEach(function (key) {
+          descriptors[key] = Object.getOwnPropertyDescriptor(win.screen, key);
+          Object.defineProperty(win.screen, key, { configurable: true, value: values[key] / realScreen.devicePixelRatio });
+        });
+        state.quality.screenOverride = true;
+      } catch (error) {
+        Object.keys(descriptors).forEach(function (key) {
+          try {
+            if (descriptors[key]) Object.defineProperty(win.screen, key, descriptors[key]);
+            else delete win.screen[key];
+          } catch (_) {}
+        });
+        recordError("stream-screen-limit", error);
+      }
+      addEvent("stream-quality", qualityProfile + " requested; actual decode size must be measured");
+    }
+
+    function toggleNextQuality() {
+      if (!/Tizen/i.test(realUserAgent)) return;
+      var next = state.quality.next === "1440p" ? "1080p" : "1440p";
+      try {
+        win.localStorage.setItem("VKPLAY_TV_QUALITY", next);
+        state.quality.next = next;
+        addEvent("stream-quality-next", next + "; relaunch module to apply");
+      } catch (error) { recordError("stream-quality", error); }
     }
 
     function installBrowserShim() {
@@ -977,6 +1091,61 @@
       });
     }
 
+    function networkEvent(transport, phase, status) {
+      // Never capture URLs, query strings, headers, SDP or message bodies.
+      try {
+        var entry = { at: new Date().toISOString(), transport: transport, phase: phase, status: Number(status) || 0 };
+        state.diagnostics.network.push(entry);
+        if (state.diagnostics.network.length > 40) state.diagnostics.network.shift();
+        if (phase === "failed" || phase === "error") queueReport(500);
+        renderOverlay();
+      } catch (_) {} // Observability must not change the transport's outcome.
+    }
+
+    function installNetworkDiagnostics() {
+      if (win.fetch) {
+        var nativeFetch = win.fetch;
+        win.fetch = function () {
+          var args = arguments;
+          var isReport = args[0] === REPORT_URL;
+          return nativeFetch.apply(this, args).then(function (response) {
+            if (!isReport && response.status >= 400) networkEvent("fetch", "failed", response.status);
+            return response;
+          }, function (error) {
+            if (!isReport) networkEvent("fetch", "error", 0);
+            throw error;
+          });
+        };
+      }
+      if (win.XMLHttpRequest) {
+        var nativeSend = win.XMLHttpRequest.prototype.send;
+        win.XMLHttpRequest.prototype.send = function () {
+          var xhr = this;
+          function complete() {
+            if (xhr.status === 0 || xhr.status >= 400) networkEvent("xhr", "failed", xhr.status);
+          }
+          xhr.addEventListener("loadend", complete, { once: true });
+          try { return nativeSend.apply(xhr, arguments); }
+          catch (error) { xhr.removeEventListener("loadend", complete); throw error; }
+        };
+      }
+      if (win.WebSocket) {
+        var NativeSocket = win.WebSocket;
+        function TracedSocket(url, protocols) {
+          var socket = arguments.length > 1 ? new NativeSocket(url, protocols) : new NativeSocket(url);
+          socket.addEventListener("open", function () { networkEvent("websocket", "open", 0); });
+          socket.addEventListener("error", function () { networkEvent("websocket", "error", 0); });
+          socket.addEventListener("close", function (event) { networkEvent("websocket", "close", event.code); });
+          return socket;
+        }
+        TracedSocket.prototype = NativeSocket.prototype;
+        Object.setPrototypeOf(TracedSocket, NativeSocket);
+        win.WebSocket = TracedSocket;
+      }
+      win.addEventListener("online", function () { networkEvent("browser", "online", 0); });
+      win.addEventListener("offline", function () { networkEvent("browser", "offline", 0); });
+    }
+
     function installRtcShim() {
       var NativePeerConnection =
         win.RTCPeerConnection || win.webkitRTCPeerConnection;
@@ -1000,7 +1169,7 @@
         pc.createOffer = function () {
           var args = arguments;
           return nativeCreateOffer.apply(pc, args).then(function (description) {
-            var patchedSdp = patchSamsungSdp(description.sdp);
+            var patchedSdp = patchSamsungSdp(description.sdp, qualityProfile);
             var count = countSamsungImageAttrs(patchedSdp);
             state.imageAttrCount = Math.max(state.imageAttrCount, count);
             if (count > 0) addEvent("sdp-patched", count + " H.264 payload(s)");
@@ -1012,7 +1181,7 @@
         pc.setLocalDescription = function (description) {
           var patched = description;
           if (description && description.sdp) {
-            var patchedSdp = patchSamsungSdp(description.sdp);
+            var patchedSdp = patchSamsungSdp(description.sdp, qualityProfile);
             try {
               description.sdp = patchedSdp;
             } catch (_) {}
@@ -1036,6 +1205,9 @@
 
         pc.addEventListener("connectionstatechange", onPeerState);
         pc.addEventListener("iceconnectionstatechange", onPeerState);
+        pc.addEventListener("icecandidateerror", function (event) {
+          networkEvent("ice", "error", event.errorCode);
+        });
         pc.addEventListener("track", function (event) {
           addEvent("remote-track", event.track ? event.track.kind : "unknown");
           queueReport(700);
@@ -1060,7 +1232,7 @@
         win.webkitRTCPeerConnection = WrappedPeerConnection;
       }
       state.rtcShim = true;
-      addEvent("rtc-shim", "Samsung imageattr 960-1920 × 540-1080 @ 60 fps");
+      addEvent("rtc-shim", "Samsung imageattr " + qualityProfile + " envelope @ 60 fps");
     }
 
     function installMediaShim() {
@@ -1228,6 +1400,8 @@
 
       function rebuildCombinedStream() {
         if (!videoElement || !videoStream) {
+          combinedStream = null;
+          if (videoElement) nativeSet(videoElement, null);
           updateTrackState();
           return;
         }
@@ -1269,6 +1443,14 @@
         stream.addEventListener("removetrack", rebuildCombinedStream);
       }
 
+      function unwatchStream(stream) {
+        if (!stream) return;
+        stream.removeEventListener("addtrack", rebuildCombinedStream);
+        stream.removeEventListener("removetrack", rebuildCombinedStream);
+        var index = watchedStreams.indexOf(stream);
+        if (index !== -1) watchedStreams.splice(index, 1);
+      }
+
       Object.defineProperty(mediaPrototype, "srcObject", {
         configurable: srcObjectDescriptor.configurable !== false,
         enumerable: srcObjectDescriptor.enumerable,
@@ -1277,6 +1459,7 @@
         },
         set: function (stream) {
           if (isVkAudio(this)) {
+            if (audioStream !== stream) unwatchStream(audioStream);
             audioElement = this;
             audioStream = stream;
             watchStream(stream);
@@ -1286,8 +1469,16 @@
           }
 
           if (isVkVideo(this)) {
+            if (videoStream !== stream) unwatchStream(videoStream);
             videoElement = this;
             videoStream = stream;
+            if (!stream) {
+              unwatchStream(audioStream);
+              audioStream = null;
+              stopStreamMouseInput();
+              vkInputBridge.token = null;
+              addEvent("media-cleared", "released previous session tracks");
+            }
             watchStream(stream);
             rebuildCombinedStream();
             return;
@@ -1349,6 +1540,21 @@
       var elementPrototype = win.Element && win.Element.prototype;
       var documentPrototype = win.Document && win.Document.prototype;
       if (!elementPrototype || !documentPrototype) return;
+
+      // VK listens to the prefixed event even if a modern browser/remote
+      // action uses the standard API. Forward only if no native prefixed
+      // event arrived for this transition.
+      var prefixedEvents = 0;
+      doc.addEventListener("webkitfullscreenchange", function () { prefixedEvents += 1; });
+      doc.addEventListener("fullscreenchange", function () {
+        var before = prefixedEvents;
+        var fullscreen = doc.fullscreenElement;
+        win.setTimeout(function () {
+          if (before === prefixedEvents && fullscreen === doc.fullscreenElement) {
+            doc.dispatchEvent(new win.Event("webkitfullscreenchange", { bubbles: true }));
+          }
+        }, 0);
+      });
 
       function refreshFullscreenState() {
         var rootElement = doc.documentElement;
@@ -1660,6 +1866,12 @@
       vkGamepadPollCount += 1;
       var raw = readGamepads();
       var output = Array.prototype.slice.call(raw || []);
+      var menuCombo = output.some(function (pad) {
+        return pad && gamepadButtonPressed(pad.buttons[8]) && gamepadButtonPressed(pad.buttons[9]);
+      });
+      if (state.streamMenuOpen || menuCombo) return output.map(function (pad) {
+        return pad ? neutralGamepadForVk(pad) : pad;
+      });
       if (!streamMouseMode && !vkMouseComboLatched) return output;
       if (vkInputBridge.token == null) return output;
 
@@ -1794,7 +2006,7 @@
       return Boolean(
         stream &&
           typeof stream.getVideoTracks === "function" &&
-          stream.getVideoTracks().length
+          stream.getVideoTracks().some(function (track) { return track.readyState !== "ended"; })
       );
     }
 
@@ -1895,7 +2107,7 @@
       var target = targetUnderVirtualCursor() || doc.body;
       if (!target) return;
       try {
-        target.dispatchEvent(
+        var accepted = target.dispatchEvent(
           new win.WheelEvent("wheel", {
             bubbles: true,
             cancelable: true,
@@ -1906,9 +2118,20 @@
             deltaMode: 0
           })
         );
-      } catch (_) {
-        win.scrollBy(0, deltaY);
+        if (!accepted) return; // A custom scroller consumed the wheel.
+      } catch (_) {}
+      // Synthetic wheels have no native scrolling default action. Walk the
+      // scroll chain, including nested catalog containers, not just window.
+      for (var node = target; node && node !== doc.documentElement; node = node.parentElement) {
+        var style = win.getComputedStyle(node);
+        if (!/(auto|scroll|overlay)/.test(style.overflowY)) continue;
+        if (node.scrollHeight <= node.clientHeight) continue;
+        var before = node.scrollTop;
+        node.scrollTop += deltaY;
+        if (node.scrollTop !== before || /contain|none/.test(style.overscrollBehaviorY)) return;
       }
+      var root = doc.scrollingElement || doc.documentElement;
+      if (root) root.scrollTop += deltaY;
     }
 
     function createStreamMouseEvent(type, button, buttons, deltaX, deltaY) {
@@ -2131,6 +2354,8 @@
 
     function showCursorMode(streamActive) {
       if (!virtualCursor || !virtualCursorHint) return;
+      // Help is available in the yellow-key panel, never over the game.
+      if (virtualCursorHint.style.display !== "none") virtualCursorHint.style.display = "none";
       if (streamActive) {
         if (virtualCursor.style.display !== "none") {
           virtualCursor.style.display = "none";
@@ -2232,18 +2457,23 @@
         sampleShellPerformance(timestamp, elapsed);
 
         var pad = firstConnectedGamepad();
-        updateVkMouseCombo(pad, streamActive);
+        var menuCombo = Boolean(pad && gamepadButtonPressed(pad.buttons[8]) && gamepadButtonPressed(pad.buttons[9]));
+        if (menuCombo && !streamMenuComboLatched && streamActive) openStreamMenu("Create+Options");
+        streamMenuComboLatched = menuCombo;
+        if (!streamActive) state.streamMenuOpen = false;
+        if (!state.streamMenuOpen) updateVkMouseCombo(pad, streamActive);
         if (vkGamepadRegistrar) {
           vkGamepadRegistrar.update(pad, streamActive, timestamp);
           state.vkGamepadRegistration = vkGamepadRegistrar.status();
           state.vkGamepadAnnounces = vkGamepadRegistrar.announces();
           state.vkGamepadPollRate = vkGamepadRegistrar.pollRate();
         }
-        showCursorMode(streamActive);
+        var streamInput = streamActive && !state.streamMenuOpen;
+        showCursorMode(streamInput);
 
         elapsed = Math.min(50, elapsed);
 
-        if (!streamActive && pad && virtualCursor) {
+        if (!streamInput && pad && virtualCursor) {
           var axisX = normalizedCursorAxis(pad.axes[0]);
           var axisY = normalizedCursorAxis(pad.axes[1]);
           var speed = Math.max(900, Math.min(win.innerWidth, win.innerHeight) * 1.25);
@@ -2272,17 +2502,17 @@
 
           if (confirmPressed && !virtualCursorButtons[0]) pressVirtualCursor();
           if (!confirmPressed && virtualCursorButtons[0]) releaseVirtualCursor();
-          if (backPressed && !virtualCursorButtons[1]) goBack();
+          if (backPressed && !virtualCursorButtons[1] && !state.streamMenuOpen) goBack();
 
           var scrollAxis = normalizedCursorAxis(pad.axes[3]);
-          if (scrollAxis) scrollVirtualCursor(scrollAxis * 34);
+          if (scrollAxis) scrollVirtualCursor(scrollAxis * 2040 * elapsed / 1000);
           virtualCursorButtons = Array.prototype.map.call(
             pad.buttons,
             function (button) {
               return Boolean(button && (button.pressed || button.value > 0.55));
             }
           );
-        } else if (streamActive && streamMouseMode && pad) {
+        } else if (streamInput && streamMouseMode && pad) {
           streamMouseInputActive = true;
           processStreamMouseInput(pad, elapsed, timestamp);
         } else if (streamActive && streamMouseInputActive) {
@@ -2336,12 +2566,62 @@
       }
     }
 
+    function openStreamMenu(source) {
+      if (!hasActiveGameStream()) return false;
+      if (state.streamMenuOpen) return true;
+      stopStreamMouseInput();
+      streamMouseInputActive = false;
+      virtualCursorButtons = [];
+      state.streamMenuOpen = true;
+      // VK's InputLockToggler opens PlayerNoErrorMenuOverlay on fullscreen
+      // exit. A fabricated Escape cannot perform the browser's default exit.
+      try {
+        if (doc.pointerLockElement && doc.exitPointerLock) doc.exitPointerLock();
+        var exit = doc.exitFullscreen || doc.webkitExitFullscreen;
+        if ((doc.fullscreenElement || doc.webkitFullscreenElement) && exit) {
+          var result = exit.call(doc);
+          if (result && result.catch) result.catch(function (error) {
+            state.streamMenuOpen = false;
+            recordError("stream-menu", error);
+          });
+        } else {
+          doc.dispatchEvent(new win.Event("webkitfullscreenchange", { bubbles: true }));
+        }
+        addEvent("stream-menu", source);
+      } catch (error) {
+        state.streamMenuOpen = false;
+        recordError("stream-menu", error);
+        return false;
+      }
+      return true;
+    }
+
     function isGameFullscreen() {
       var fullscreen = doc.webkitFullscreenElement || doc.fullscreenElement;
       return Boolean(fullscreen && hasActiveGameStream());
     }
 
     function requestFullscreen() {
+      if (state.streamMenuOpen && hasActiveGameStream()) {
+        // VK's Continue handler hides Fl/kl before entering fullscreen. A raw
+        // fullscreen request leaves its menu open and makes Continue a no-op.
+        // Use only the observed menu/button contract, never a catalog action.
+        var buttons = doc.querySelectorAll("[class*='Menu_container'] button[class*='Item_button']");
+        for (var index = 0; index < buttons.length; index += 1) {
+          var button = buttons[index];
+          var label = normalizeActionText(button.textContent);
+          if (!button.disabled && isVisibleElement(button) &&
+              (label === "продолжить сессию" || label === "continue session")) {
+            button.click();
+            addEvent("stream-menu", "continue-action");
+            return;
+          }
+        }
+        // A nested settings menu or changed VK markup must remain navigable.
+        // Do not guess an action or falsely restore game input.
+        addEvent("stream-menu", "continue-action-unavailable");
+        return;
+      }
       var target = doc.documentElement;
       var request = target.webkitRequestFullscreen || target.requestFullscreen;
       if (!request) return;
@@ -2358,6 +2638,7 @@
     }
 
     function installRemoteNavigation() {
+      var greenPressedAt = 0;
       var directions = {
         ArrowLeft: "left",
         ArrowRight: "right",
@@ -2365,29 +2646,38 @@
         ArrowDown: "down"
       };
 
-      doc.addEventListener(
+      win.addEventListener(
         "keydown",
         function (event) {
           var keyCode = event.keyCode || event.which;
 
           if (keyCode === 403) {
             event.preventDefault();
+            event.stopImmediatePropagation();
             sendReport("red-key");
             return;
           }
           if (keyCode === 404) {
             event.preventDefault();
-            requestFullscreen();
+            event.stopImmediatePropagation();
+            if (!greenPressedAt) greenPressedAt = Date.now();
             return;
           }
           if (keyCode === 405) {
             event.preventDefault();
+            event.stopImmediatePropagation();
+            if (event.repeat) return;
             overlayVisible = !overlayVisible;
-            if (overlay) overlay.style.opacity = overlayVisible ? "1" : "0.3";
             renderOverlay();
             return;
           }
           if (keyCode === 406) {
+            if (hasActiveGameStream()) {
+              event.preventDefault();
+              event.stopImmediatePropagation();
+              if (!event.repeat) openStreamMenu("blue-key");
+              return;
+            }
             if (activateVkIdAction("blue-key")) {
               event.preventDefault();
               event.stopPropagation();
@@ -2397,11 +2687,11 @@
           if (keyCode === 10009) {
             event.preventDefault();
             event.stopPropagation();
-            goBack();
+            if (!openStreamMenu("back-key")) goBack();
             return;
           }
 
-          if (isGameFullscreen()) return;
+          if (hasActiveGameStream()) return; // VK handles arrows in its own menu.
 
           var direction = directions[event.key] || {
             37: "left",
@@ -2421,6 +2711,35 @@
         },
         true
       );
+      win.addEventListener("keyup", function (event) {
+        var keyCode = event.keyCode || event.which;
+        if (keyCode >= 403 && keyCode <= 405 || keyCode === 406 && hasActiveGameStream()) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
+        if (keyCode === 404 && greenPressedAt) {
+          var held = Date.now() - greenPressedAt;
+          greenPressedAt = 0;
+          if (held >= 1200) toggleNextQuality();
+          else requestFullscreen();
+        }
+      }, true);
+      win.addEventListener("blur", function () { greenPressedAt = 0; });
+      function onFullscreenChange() {
+        if (!hasActiveGameStream()) return;
+        var fullscreen = Boolean(doc.fullscreenElement || doc.webkitFullscreenElement);
+        if (fullscreen && state.streamMenuOpen) {
+          state.streamMenuOpen = false;
+          virtualCursorButtons = [];
+          addEvent("stream-menu", "resumed");
+        } else if (!fullscreen && !state.streamMenuOpen) {
+          stopStreamMouseInput();
+          streamMouseInputActive = false;
+          state.streamMenuOpen = true;
+        }
+      }
+      doc.addEventListener("fullscreenchange", onFullscreenChange);
+      doc.addEventListener("webkitfullscreenchange", onFullscreenChange);
       addEvent("remote-navigation", "arrows / Enter / Back / color keys");
     }
 
@@ -2562,12 +2881,6 @@
         style.textContent =
           "html,body{width:100%;height:100%;margin:0;overscroll-behavior:none}" +
           "body{overflow-x:hidden}" +
-          "a:focus,button:focus,input:focus,select:focus,textarea:focus," +
-          "iframe:focus,[role=button]:focus,[tabindex]:focus{" +
-          "outline:4px solid #b6e824!important;outline-offset:4px!important;" +
-          "box-shadow:0 0 0 8px rgba(182,232,36,.25)!important}" +
-          "[data-vkplay-tv-pointer-target=true]{" +
-          "outline:4px solid #b6e824!important;outline-offset:4px!important}" +
           "#vkplay-tizen-tv-cursor{position:fixed;z-index:2147483647;width:28px;" +
           "height:28px;transform:translate3d(-50%,-50%,0);border:4px solid #fff;" +
           "border-radius:50%;background:#b6e824;pointer-events:none;" +
@@ -2604,6 +2917,8 @@
         overlay.appendChild(overlayDetails);
         doc.body.appendChild(overlay);
       }
+      overlay.style.display = overlayVisible ? "block" : "none";
+      if (!overlayVisible) return;
 
       var connected = state.peerStates.some(function (peer) {
         return peer.connectionState === "connected";
@@ -2621,6 +2936,10 @@
         overlayDetails
       );
       overlay.setAttribute("data-open", overlayVisible ? "true" : "false");
+      var stream = state.diagnostics.stream;
+      function metric(value) { return value == null ? "?" : String(value); }
+      var network = state.diagnostics.network;
+      var lastNetwork = network[network.length - 1];
       overlayDetails.textContent =
         "SDP: " +
         state.imageAttrCount +
@@ -2664,15 +2983,20 @@
         state.diagnostics.shell.averageFrameMs +
         " ms · long " +
         state.diagnostics.shell.longFrames +
-        "\nДо игры: стик = курсор · В игре: L1+R1+Options = мышь TV→VK";
+        "\nПоток: " + metric(stream.decodedFps) + " fps · " + metric(stream.bitrateMbps) + " Mbps · " + stream.codec +
+        "\nDecode: " + metric(stream.decodeMs) + " ms · буфер " + metric(stream.jitterBufferMs) + " ms" +
+        "\nRTT: " + metric(stream.rttMs) + " ms · потери " + metric(stream.lossPercent) + "%" +
+        "\nСеть: " + (lastNetwork ? lastNetwork.transport + " " + lastNetwork.phase + " " + lastNetwork.status : "ошибок не записано") +
+        "\nЗапрошено: " + state.quality.active + " · после перезапуска: " + state.quality.next +
+        "\nHDR потока: неизвестно · HDR ТВ: " + (state.diagnostics.display.hdrSupported == null ? "?" : state.diagnostics.display.hdrSupported ? "поддерживается" : "нет") +
+        "\nL1+R1+Options = мышь · Create+Options = меню VK" +
+        "\nКрасная: отчёт · Синяя/Назад: меню · Жёлтая: скрыть" +
+        "\nЗелёная: полный экран · держать 2 с: 1080p/1440p на следующий запуск";
     }
 
     function installOverlay() {
       function mount() {
         renderOverlay();
-        win.setTimeout(function () {
-          if (!overlayVisible && overlay) overlay.style.opacity = "0.3";
-        }, 7000);
       }
       if (doc.body) mount();
       else doc.addEventListener("DOMContentLoaded", mount, { once: true });
@@ -2742,14 +3066,46 @@
     function installDiagnosticsSampler() {
       if (!isTopLevelContext || !isCloudHost) return;
       var pending = false;
+      var previousStats = [];
+      var nextSaveAt = 0;
+      var nextPeriodicReportAt = Date.now() + 60000;
+      try {
+        var saved = win.localStorage.getItem("VKPLAY_TV_LAST_DIAGNOSTICS");
+        if (saved && saved.length <= 64000) {
+          var parsed = JSON.parse(saved);
+          if (parsed && parsed.schema === 1) state.diagnostics.previousRun = parsed;
+        }
+      } catch (_) {}
+
+      function saveCompactDiagnostics() {
+        if (!state.diagnostics.history.length && !state.diagnostics.network.length) return;
+        try {
+          // Small, bounded summary; no auth state, raw socket messages or recursion.
+          var summary = {
+            schema: 1, at: new Date().toISOString(), version: VERSION,
+            stream: state.diagnostics.stream, shell: state.diagnostics.shell,
+            network: state.diagnostics.network.slice(-12),
+            samples: state.diagnostics.history.slice(-30).map(function (sample) {
+              return { at: sample.at, stream: sample.stream, shellFps: sample.shell.fps,
+                intrinsic: sample.video.intrinsic, layout: sample.video.layout };
+            })
+          };
+          win.localStorage.setItem("VKPLAY_TV_LAST_DIAGNOSTICS", JSON.stringify(summary));
+        } catch (_) {} // Storage failure must never interrupt a session.
+      }
+      win.addEventListener("pagehide", saveCompactDiagnostics);
+      doc.addEventListener("visibilitychange", function () { if (doc.hidden) saveCompactDiagnostics(); });
       win.setInterval(function () {
         if (pending || doc.hidden) return;
         pending = true;
         collectStats().then(function (stats) {
+          state.diagnostics.stream = summarizeStreamMetrics(stats, previousStats);
+          previousStats = stats;
           state.diagnostics.history.push({
             at: new Date().toISOString(),
             shell: Object.assign({}, state.diagnostics.shell),
             video: Object.assign({}, state.diagnostics.video),
+            stream: Object.assign({}, state.diagnostics.stream),
             inputMode: streamMouseMode ? "mouse" : "gamepad",
             registration: state.vkGamepadRegistration,
             announces: state.vkGamepadAnnounces,
@@ -2758,6 +3114,13 @@
             rtcStats: stats
           });
           if (state.diagnostics.history.length > 60) state.diagnostics.history.shift();
+          renderOverlay();
+          var now = Date.now();
+          if (now >= nextSaveAt) { nextSaveAt = now + 15000; saveCompactDiagnostics(); }
+          if (hasActiveGameStream() && now >= nextPeriodicReportAt) {
+            nextPeriodicReportAt = now + 60000;
+            queueReport(0);
+          }
           pending = false;
         }, function (error) {
           pending = false;
@@ -2779,7 +3142,8 @@
             modelCode: TARGET_MODEL,
             realUserAgent: realUserAgent,
             effectiveUserAgent: nav.userAgent,
-            screen: win.screen.width + "x" + win.screen.height,
+            screen: realScreen.width + "x" + realScreen.height,
+            effectiveScreen: win.screen.width + "x" + win.screen.height,
             devicePixelRatio: win.devicePixelRatio
           },
           viewport: {
@@ -2807,6 +3171,7 @@
             combinedTracks: state.combinedTracks
           },
           diagnostics: state.diagnostics,
+          quality: Object.assign({}, state.quality),
           input: {
             mode: streamMouseMode ? "mouse" : "gamepad",
             registration: state.vkGamepadRegistration,
@@ -2913,6 +3278,8 @@
       return publicApi;
     }
     if (isCloudHost) {
+      configureStreamQuality();
+      installNetworkDiagnostics();
       installVkMouseComboShim();
       installVkBrowserGate();
       installRtcShim();
@@ -2945,6 +3312,7 @@
     imageAttr: IMAGE_ATTR,
     patchSamsungSdp: patchSamsungSdp,
     countSamsungImageAttrs: countSamsungImageAttrs,
+    summarizeStreamMetrics: summarizeStreamMetrics,
     neutralGamepadButtons: neutralGamepadButtons,
     wrapVkLaunchFactory: wrapVkLaunchFactory,
     patchVkLaunchFactory: patchVkLaunchFactory,
