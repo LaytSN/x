@@ -13,7 +13,7 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.17";
+  var VERSION = "0.1.18";
   var RELAY_URL = "http://127.0.0.1:8788";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
@@ -311,6 +311,7 @@
 
   function captureVkInputTransmitter(bridge, transmitter) {
     if (!bridge || !transmitter) return transmitter;
+    if (bridge.transmitter !== transmitter) bridge.token = null;
     bridge.transmitter = transmitter;
     bridge.transmitterReady = true;
 
@@ -320,7 +321,7 @@
     ) {
       var nativeFlush = transmitter.flush;
       function capturedFlush(force, secondary, token) {
-        if (token !== undefined && token !== null && token !== "") {
+        if (bridge.transmitter === this && token !== undefined && token !== null && token !== "") {
           var firstToken = bridge.token == null;
           bridge.token = token;
           if (firstToken) notifyVkInputBridge(bridge, "ready", "session token captured");
@@ -336,6 +337,21 @@
       } catch (error) {
         failVkInputBridge(bridge, error);
       }
+    }
+
+    if (typeof transmitter.delete === "function" && !transmitter.delete.__vkplayTizenInputDelete) {
+      var nativeDelete = transmitter.delete;
+      function capturedDelete() {
+        if (bridge.transmitter === this) {
+          bridge.transmitter = null;
+          bridge.transmitterReady = false;
+          bridge.token = null;
+          notifyVkInputBridge(bridge, "transmitter-destroyed", "waiting for next player input");
+        }
+        return nativeDelete.apply(this, arguments);
+      }
+      capturedDelete.__vkplayTizenInputDelete = true;
+      transmitter.delete = capturedDelete;
     }
 
     notifyVkInputBridge(
@@ -358,7 +374,7 @@
     ) {
       notifyVkInputBridge(
         bridge,
-        bridge.transmitterReady ? "transmitter-ready" : "module-ready",
+        bridge.token != null ? "ready" : bridge.transmitterReady ? "transmitter-ready" : "module-ready",
         "VK input WASM loaded"
       );
       return moduleValue;
@@ -410,6 +426,47 @@
 
     notifyVkInputBridge(bridge, "module-ready", "VK input WASM patched");
     return moduleValue;
+  }
+
+  // The standalone MGCWebRTCPlayer has a PRIVATE webpack runtime, unrelated
+  // to webpackChunkcg_frontend. Its SDK calls wasmFactory().then(module =>
+  // new module.InputTransmitter()). Observe that existing resolution before
+  // the callback, without loading/evaluating source or allocating more WASM.
+  // Only own data properties are inspected; unrelated accessors are not run.
+  function installVkInputPromiseHook(win, bridge) {
+    if (!win.Promise || !bridge) return false;
+    var prototype = win.Promise.prototype;
+    var nativeThen = prototype.then;
+    if (nativeThen.__vkplayTizenInputResolution) return true;
+    function ownValue(object, key) {
+      var descriptor = Object.getOwnPropertyDescriptor(object, key);
+      return descriptor && descriptor.value;
+    }
+    function inputThen(onFulfilled, onRejected) {
+      var callback = onFulfilled;
+      if (typeof callback === "function") {
+        onFulfilled = function (value) {
+          try {
+            if (value && typeof value === "object" &&
+                typeof ownValue(value, "InputTransmitter") === "function" &&
+                typeof ownValue(value, "timestamp") === "function" &&
+                typeof ownValue(value, "MOUSE_DEV_ID_OFFSET") === "number" &&
+                ownValue(value, "MouseEventType")) {
+              patchVkInputModule(value, bridge);
+            }
+          } catch (error) { failVkInputBridge(bridge, error); }
+          return callback.apply(this, arguments);
+        };
+      }
+      return nativeThen.call(this, onFulfilled, onRejected);
+    }
+    inputThen.__vkplayTizenInputResolution = true;
+    try {
+      prototype.then = inputThen;
+      if (prototype.then !== inputThen) return false;
+      notifyVkInputBridge(bridge, "waiting-for-input-module", "standalone player input observer installed");
+      return true;
+    } catch (error) { failVkInputBridge(bridge, error); return false; }
   }
 
   function wrapVkInputFactory(factory, bridge) {
@@ -862,10 +919,16 @@
         detail: scrubDiagnosticText(detail).slice(0, 512),
         runId: runId
       };
-      var last = state.diagnostics.trace[state.diagnostics.trace.length - 1];
-      if (last && last.type === type && last.detail === entry.detail && Date.now() - Date.parse(last.at) < 5000) {
-        last.repeats = (last.repeats || 1) + 1;
-        return last;
+      // VK's failed telemetry alternates fetch/error messages. Coalesce across
+      // interleaving entries too, so the flood cannot erase the input timeline.
+      for (var i = state.diagnostics.trace.length - 1; i >= 0; i -= 1) {
+        var last = state.diagnostics.trace[i];
+        if (Date.now() - Date.parse(last.at) >= 5000) break;
+        if (last.type === type && last.detail === entry.detail) {
+          last.repeats = (last.repeats || 1) + 1;
+          last.lastAt = entry.at;
+          return last;
+        }
       }
       recentEvents.push(entry);
       if (recentEvents.length > 60) recentEvents.shift();
@@ -877,9 +940,8 @@
         win.clearTimeout(journalTimer);
         journalTimer = win.setTimeout(persistJournal, 300);
       }
-      try {
-        win.console.info("[VK TV] " + type, entry.detail);
-      } catch (_) {}
+      // Do not echo captured console/network events back into page console:
+      // SDK instrumentation can observe it. The persisted journal is the sink.
       return entry;
     }
 
@@ -941,6 +1003,7 @@
       try {
         var url = new win.URL(String(value || ""), win.location.href);
         if (url.origin === RELAY_URL) return "report-relay";
+        if (url.hostname === "lambda.cloud.vkplay.ru") return "vk-telemetry";
         if (/\.(vkplay|my\.games)\.(ru|com)$/.test(url.hostname) || url.hostname === "cloud.vkplay.ru") {
           var category = /\.(js|css|wasm)$/.test(url.pathname) ? "asset" : /session|stream|play/i.test(url.pathname) ? "session" : "api";
           return "vk-" + category;
@@ -1144,10 +1207,8 @@
     function installVkBrowserGate() {
       var attempts = 0;
       var factoryPatched = false;
-      var inputFactoryPatched = false;
       var runtimeRequire = null;
       state.vkBrowserGate = "waiting-for-vk-runtime";
-      state.vkInputTransmitter = "waiting-for-vk-runtime";
 
       function markPatched(detail) {
         if (factoryPatched) return;
@@ -1162,9 +1223,6 @@
         try {
           if (patchVkLaunchFactory(requireModule)) {
             markPatched("launch module patched");
-          }
-          if (patchVkInputFactory(requireModule, vkInputBridge)) {
-            inputFactoryPatched = true;
           }
         } catch (error) {
           recordError("vk-browser-gate", error);
@@ -1185,9 +1243,6 @@
           try {
             if (patchVkLaunchChunk(payload)) {
               markPatched("launch chunk intercepted");
-            }
-            if (patchVkInputChunk(payload, vkInputBridge)) {
-              inputFactoryPatched = true;
             }
           } catch (error) {
             recordError("vk-runtime-chunk", error);
@@ -1222,16 +1277,12 @@
           }
         }
 
-        if ((!factoryPatched || !inputFactoryPatched) && attempts < 1200) {
+        if (!factoryPatched && attempts < 1200) {
           win.setTimeout(attempt, 500);
         } else {
           if (!factoryPatched) {
             state.vkBrowserGate = "vk-launch-module-not-found";
             addEvent("vk-browser-gate", "VK launch module was not found");
-          }
-          if (!inputFactoryPatched) {
-            state.vkInputTransmitter = "vk-input-module-not-found";
-            addEvent("vk-native-input", "VK input module was not found");
           }
         }
       }
@@ -2167,7 +2218,7 @@
         state.inputMode = streamMouseMode ? "vk-virtual-mouse" : "vk-gamepad";
         addEvent(
           "vk-mouse-combo",
-          streamMouseMode ? "VK native mouse enabled" : "gamepad enabled"
+          streamMouseMode ? (vkInputBridge.token == null ? "mouse requested; native input not ready" : "VK native mouse enabled") : "gamepad enabled"
         );
       } else if (!comboPressed && vkMouseComboLatched) {
         vkMouseComboLatched = false;
@@ -3191,7 +3242,7 @@
         state.diagnostics.shell.averageFrameMs +
         " ms · long " +
         state.diagnostics.shell.longFrames +
-        "\nПоток" + (stream.stale ? " (старый замер)" : "") + ": " + metric(stream.decodedFps) + " fps · " + metric(stream.bitrateMbps) + " Mbps · " + stream.codec +
+        "\nДекодирование" + (stream.stale ? " (старый замер)" : "") + ": " + metric(stream.decodedFps) + " fps (не FPS игры) · " + metric(stream.bitrateMbps) + " Mbps · " + stream.codec +
         "\nDecode: " + metric(stream.decodeMs) + " ms · буфер " + metric(stream.jitterBufferMs) + " ms" +
         "\nRTT: " + metric(stream.rttMs) + " ms · потери " + metric(stream.lossPercent) + "%" +
         "\nСеть: " + (lastNetwork ? lastNetwork.transport + " " + lastNetwork.phase + " " + lastNetwork.status : "ошибок не записано") +
@@ -3345,6 +3396,18 @@
       }, 2000);
     }
 
+    function playerVideoSettings() {
+      // Only numeric video preferences, never enumerate auth/session storage.
+      var settings = {};
+      ["RESOLUTION", "FPS", "QUALITY_PRESET", "CODEC", "PROFILE", "MIN_BITRATE", "MAX_BITRATE", "START_BITRATE", "SLICES", "REF_FRAMES"].forEach(function (name) {
+        try {
+          var value = win.localStorage.getItem("WEB_PLAYER_VIDEO_" + name);
+          settings[name.toLowerCase()] = value != null && /^\d{1,9}$/.test(value) ? Number(value) : null;
+        } catch (_) { settings[name.toLowerCase()] = null; }
+      });
+      return settings;
+    }
+
     function buildReport(reason) {
       summarizePeers();
       updateGamepads();
@@ -3390,9 +3453,11 @@
           },
           diagnostics: state.diagnostics,
           reporting: Object.assign({}, state.reporting, { status: state.reportStatus, error: state.reportError }),
-          quality: Object.assign({}, state.quality),
+          quality: Object.assign({}, state.quality, { playerSettings: playerVideoSettings() }),
           input: {
             mode: streamMouseMode ? "mouse" : "gamepad",
+            nativeMouseReady: Boolean(vkInputBridge.transmitter && vkInputBridge.token != null),
+            nativeMouseError: vkInputBridge.lastError == null ? null : scrubDiagnosticText(vkInputBridge.lastError),
             registration: state.vkGamepadRegistration,
             announces: state.vkGamepadAnnounces,
             pollCount: vkGamepadPollCount,
@@ -3559,6 +3624,10 @@
       configureStreamQuality();
       installNetworkDiagnostics();
       installVkMouseComboShim();
+      if (!installVkInputPromiseHook(win, vkInputBridge)) {
+        state.vkInputTransmitter = "input-observer-unavailable";
+        addEvent("vk-native-input", "input observer could not be installed");
+      }
       installVkBrowserGate();
       installRtcShim();
       installMediaShim();
@@ -3605,6 +3674,7 @@
     patchVkInputFactory: patchVkInputFactory,
     patchVkInputChunk: patchVkInputChunk,
     patchVkInputModule: patchVkInputModule,
+    installVkInputPromiseHook: installVkInputPromiseHook,
     sendVkNativeMouse: sendVkNativeMouse,
     install: install
   };
