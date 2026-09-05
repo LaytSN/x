@@ -1,6 +1,6 @@
 {
   "name": "vkplay-tizenbrew-client",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "description": "Samsung Tizen TV compatibility layer for VK Play Cloud",
   "packageType": "mods",
   "appName": "VK Play Cloud TV",
