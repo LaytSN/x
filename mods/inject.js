@@ -13,7 +13,7 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.18";
+  var VERSION = "0.1.19";
   var RELAY_URL = "http://127.0.0.1:8788";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
@@ -346,6 +346,10 @@
           bridge.transmitter = null;
           bridge.transmitterReady = false;
           bridge.token = null;
+          // The SDK releases its module on destroy. Do not keep its WASM heap
+          // alive until a replacement has already managed to allocate memory.
+          bridge.module = null;
+          bridge.moduleReady = false;
           notifyVkInputBridge(bridge, "transmitter-destroyed", "waiting for next player input");
         }
         return nativeDelete.apply(this, arguments);
@@ -398,6 +402,10 @@
         failVkInputBridge(bridge, error);
         throw error;
       }
+      // The SDK can construct another transmitter from a module it still owns.
+      bridge.module = moduleValue;
+      bridge.moduleReady = true;
+      bridge.lastError = null;
       return captureVkInputTransmitter(bridge, instance);
     }
 
@@ -1096,13 +1104,20 @@
       try {
         var stored = win.localStorage.getItem("VKPLAY_TV_QUALITY");
         qualityProfile = stored === "1080p" || uhd === false ? "1080p" : "1440p";
-        if (win.localStorage.getItem("VKPLAY_TV_QUALITY_APPLIED") !== qualityProfile) {
+        var selectedResolution = qualityProfile === "1440p" ? "7" : "5";
+        if (win.localStorage.getItem("VKPLAY_TV_QUALITY_APPLIED") !== qualityProfile ||
+            win.localStorage.getItem("WEB_PLAYER_VIDEO_RESOLUTION") !== selectedResolution ||
+            win.localStorage.getItem("WEB_PLAYER_VIDEO_FPS") !== "3" ||
+            win.localStorage.getItem("WEB_PLAYER_VIDEO_QUALITY_PRESET") !== "4") {
           // These enums are from VK's official web player Ml.loadConfig / Li / Qi.
-          // Apply once per selection; later edits in VK's own configurator survive.
-          win.localStorage.setItem("WEB_PLAYER_VIDEO_RESOLUTION", qualityProfile === "1440p" ? "7" : "5");
+          // Auto/high resets the FPS preference; our Chrome OS identity permits
+          // 120fps there, incompatible with the 60fps Tizen decoder envelope.
+          // Reconcile at module startup, not continuously in a running session.
+          win.localStorage.setItem("WEB_PLAYER_VIDEO_RESOLUTION", selectedResolution);
           win.localStorage.setItem("WEB_PLAYER_VIDEO_FPS", "3");
           win.localStorage.setItem("WEB_PLAYER_VIDEO_QUALITY_PRESET", "4");
           win.localStorage.setItem("VKPLAY_TV_QUALITY_APPLIED", qualityProfile);
+          addEvent("stream-quality-reconciled", qualityProfile + " / 60fps / manual restored at startup");
         }
       } catch (error) {
         qualityProfile = "1080p";
@@ -3457,6 +3472,7 @@
           input: {
             mode: streamMouseMode ? "mouse" : "gamepad",
             nativeMouseReady: Boolean(vkInputBridge.transmitter && vkInputBridge.token != null),
+            wasmModuleHeld: Boolean(vkInputBridge.module),
             nativeMouseError: vkInputBridge.lastError == null ? null : scrubDiagnosticText(vkInputBridge.lastError),
             registration: state.vkGamepadRegistration,
             announces: state.vkGamepadAnnounces,
