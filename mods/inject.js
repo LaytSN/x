@@ -13,8 +13,8 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
-  var VERSION = "0.1.16";
-  var REPORT_URL = "http://192.168.0.219:8787/report";
+  var VERSION = "0.1.17";
+  var RELAY_URL = "http://127.0.0.1:8788";
   var TARGET_MODEL = "Samsung UE55U8000FUXCE";
   var SPOOFED_UA =
     "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) " +
@@ -28,6 +28,24 @@
       return String((error.name || "Error") + ": " + (error.message || error));
     }
     return String(error);
+  }
+
+  function scrubDiagnosticText(value) {
+    return String(value == null ? "" : value)
+      .replace(/\b(?:https?|wss?):\/\/[^\s<>"')]+/gi, "[URL]")
+      .replace(/[?#][^\s<>"')\]]+/g, "[query/fragment omitted]")
+      .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[email]")
+      .replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, "$1 [redacted]")
+      .replace(/\b([A-Za-z_]*(?:token|password|passwd|cookie|authorization|sessionid|session_id|secret)[A-Za-z_]*)["']?\s*[=:]\s*(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi, "$1=[redacted]")
+      .replace(/\b[A-Za-z0-9_+\/-]{48,}={0,2}\b/g, "[opaque]")
+      .slice(0, 1200);
+  }
+
+  function scrubReport(value) {
+    return JSON.parse(JSON.stringify(value, function (key, item) {
+      if (/token|password|cookie|authorization|secret/i.test(key)) return "[redacted]";
+      return typeof item === "string" ? scrubDiagnosticText(item) : item;
+    }));
   }
 
   function patchSamsungSdp(sdp, profile) {
@@ -683,6 +701,7 @@
 
     var doc = win.document;
     var nav = win.navigator;
+    var reportFetch = win.fetch ? win.fetch.bind(win) : null;
     var realUserAgent = nav.userAgent;
     var realScreen = { width: win.screen.width, height: win.screen.height, devicePixelRatio: win.devicePixelRatio || 1 };
     var qualityProfile = "1080p";
@@ -693,6 +712,13 @@
     var reportTimer = 0;
     var reportInFlight = null;
     var nextAutomaticReportAt = 0;
+    var runId = "tv-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+    var reportSequence = 0;
+    var outbox = [];
+    var journalTimer = 0;
+    var logView = null;
+    var logText = null;
+    var logsVisible = false;
     var overlay = null;
     var overlayDetails = null;
     var overlayVisible = false;
@@ -779,20 +805,77 @@
       },
       reportStatus: "not-sent",
       reportError: null,
+      reportId: null,
+      runId: runId,
+      reporting: { transport: "tizenbrew-loopback", service: "unknown", storage: "unknown", pending: 0, evicted: 0, lastDeliveredId: null },
       errors: []
     };
+
+    function persistJournal() {
+      if (!isCloudHost || !isTopLevelContext) return;
+      win.clearTimeout(journalTimer);
+      try {
+        win.localStorage.setItem("VKPLAY_TV_JOURNAL", JSON.stringify({
+          runId: runId, version: VERSION, at: new Date().toISOString(),
+          entries: state.diagnostics.trace.slice(-120), errors: state.errors.slice(-20),
+          reportStatus: state.reportStatus, reportError: state.reportError
+        }));
+      } catch (error) { state.reporting.storage = scrubDiagnosticText(errorText(error)); }
+    }
+
+    function persistOutbox() {
+      state.reporting.pending = outbox.length;
+      try {
+        win.localStorage.setItem("VKPLAY_TV_OUTBOX", JSON.stringify(outbox));
+        state.reporting.storage = "saved";
+      } catch (error) { state.reporting.storage = scrubDiagnosticText(errorText(error)); }
+    }
+
+    function restoreReportStorage() {
+      if (!isCloudHost || !isTopLevelContext) return;
+      try {
+        var previous = win.localStorage.getItem("VKPLAY_TV_JOURNAL");
+        if (previous && previous.length < 250000) {
+          var journal = JSON.parse(previous);
+          state.diagnostics.previousJournal = Array.isArray(journal.entries) ? scrubReport(journal.entries.slice(-120)) : [];
+          state.diagnostics.previousErrors = Array.isArray(journal.errors) ? scrubReport(journal.errors.slice(-20)) : [];
+        }
+      } catch (error) { state.reporting.storage = "journal restore: " + scrubDiagnosticText(errorText(error)); }
+      try {
+        var saved = win.localStorage.getItem("VKPLAY_TV_OUTBOX");
+        if (saved && saved.length < 3000000) {
+          var pending = JSON.parse(saved);
+          if (Array.isArray(pending)) outbox = pending.filter(function (report) {
+            return report && report.schema === "vkplay-tizen-live/1" && /^[a-zA-Z0-9_-]{1,100}$/.test(report.reportId || "");
+          }).slice(-3).map(scrubReport);
+        }
+      } catch (error) { state.reporting.storage = "outbox restore: " + scrubDiagnosticText(errorText(error)); }
+      state.reporting.pending = outbox.length;
+      win.addEventListener("pagehide", persistJournal);
+      doc.addEventListener("visibilitychange", function () { if (doc.hidden) persistJournal(); });
+    }
 
     function traceEvent(type, detail) {
       var entry = {
         at: new Date().toISOString(),
         type: type,
-        detail: detail == null ? "" : String(detail).slice(0, 512)
+        detail: scrubDiagnosticText(detail).slice(0, 512),
+        runId: runId
       };
+      var last = state.diagnostics.trace[state.diagnostics.trace.length - 1];
+      if (last && last.type === type && last.detail === entry.detail && Date.now() - Date.parse(last.at) < 5000) {
+        last.repeats = (last.repeats || 1) + 1;
+        return last;
+      }
       recentEvents.push(entry);
       if (recentEvents.length > 60) recentEvents.shift();
       state.diagnostics.trace.push(entry);
-      if (state.diagnostics.trace.length > 160) {
+      if (state.diagnostics.trace.length > 120) {
         state.diagnostics.trace.shift();
+      }
+      if (isCloudHost && isTopLevelContext) {
+        win.clearTimeout(journalTimer);
+        journalTimer = win.setTimeout(persistJournal, 300);
       }
       try {
         win.console.info("[VK TV] " + type, entry.detail);
@@ -806,7 +889,7 @@
     }
 
     function recordError(scope, error) {
-      var message = errorText(error);
+      var message = scrubDiagnosticText(errorText(error));
       var previous = state.errors[state.errors.length - 1];
       if (previous && previous.scope === scope && previous.error === message &&
           Date.now() - Date.parse(previous.at) < 5000) {
@@ -816,12 +899,89 @@
       var entry = {
         at: new Date().toISOString(),
         scope: scope,
-        error: message.slice(0, 512)
+        error: message.slice(0, 512),
+        stack: error && error.stack ? scrubDiagnosticText(error.stack) : null,
+        runId: runId
       };
       state.errors.push(entry);
       if (state.errors.length > 30) state.errors.shift();
       addEvent("error:" + scope, entry.error);
       queueReport(500);
+    }
+
+    function installErrorJournal() {
+      if (!isCloudHost || !isTopLevelContext) return;
+      ["warn", "error"].forEach(function (level) {
+        var original = win.console && win.console[level];
+        if (typeof original !== "function") return;
+        win.console[level] = function () {
+          try {
+            var parts = Array.prototype.slice.call(arguments, 0, 4).map(function (value) {
+              if (value instanceof Error) return scrubDiagnosticText(errorText(value) + "\n" + (value.stack || ""));
+              if (value && typeof value === "object") return "[object omitted]";
+              return scrubDiagnosticText(value);
+            });
+            traceEvent("console-" + level, parts.join(" "));
+            queueReport(1200);
+          } catch (_) {}
+          return original.apply(win.console, arguments);
+        };
+      });
+      win.addEventListener("securitypolicyviolation", function (event) {
+        recordError("browser-policy", new Error(String(event.effectiveDirective || event.violatedDirective) + "; destination " + endpointCategory(event.blockedURI)));
+      });
+      win.addEventListener("error", function (event) {
+        if (event.target && event.target !== win && event.target.tagName) {
+          recordError("resource-load", new Error(event.target.tagName + " " + endpointCategory(event.target.src || event.target.href)));
+        }
+      }, true);
+    }
+
+    function endpointCategory(value) {
+      try {
+        var url = new win.URL(String(value || ""), win.location.href);
+        if (url.origin === RELAY_URL) return "report-relay";
+        if (/\.(vkplay|my\.games)\.(ru|com)$/.test(url.hostname) || url.hostname === "cloud.vkplay.ru") {
+          var category = /\.(js|css|wasm)$/.test(url.pathname) ? "asset" : /session|stream|play/i.test(url.pathname) ? "session" : "api";
+          return "vk-" + category;
+        }
+        if (/^(id|oauth|login)\.vk\.(com|ru)$/.test(url.hostname)) return "vk-auth";
+        return "other";
+      } catch (_) { return "unknown"; }
+    }
+
+    function showLogs(force) {
+      if (!isCloudHost || !doc.body) return;
+      logsVisible = typeof force === "boolean" ? force : !logsVisible;
+      if (!logView) {
+        logView = doc.createElement("div"); logView.id = "vkplay-tizen-tv-log-view";
+        logView.style.cssText = "position:fixed;inset:4vh 4vw;z-index:2147483647;background:#101820;color:#fff;padding:24px;border:2px solid #a7b4c0;font:22px/1.4 monospace;box-sizing:border-box";
+        var title = doc.createElement("div"); title.textContent = "Журнал VK TV · ↑/↓ прокрутка · Назад: закрыть · Красная: отчёт";
+        logText = doc.createElement("pre"); logText.style.cssText = "white-space:pre-wrap;overflow:auto;height:calc(100% - 55px);font:inherit;margin:14px 0";
+        logView.appendChild(title); logView.appendChild(logText); doc.body.appendChild(logView);
+      }
+      logView.style.display = logsVisible ? "block" : "none";
+      if (!logsVisible) { virtualCursorButtons = []; return; }
+      stopStreamMouseInput();
+      var lines = ["Версия " + VERSION + " · запуск " + runId,
+        "Отчёт " + (state.reportId || "—") + ": " + state.reportStatus,
+        "Передача: " + (state.reportError || "ошибок не записано"),
+        "Хранение: " + state.reporting.storage + " · ожидают " + outbox.length,
+        "\nТЕКУЩИЙ ЗАПУСК (новые сверху)"];
+      function rows(entries) { return entries.slice().reverse().map(function (entry) {
+        return String(entry.at || "") + " " + String(entry.type || "") + " " + scrubDiagnosticText(entry.detail) + (entry.repeats ? " ×" + entry.repeats : "");
+      }); }
+      function errorRows(entries) { return entries.slice().reverse().map(function (entry) {
+        return String(entry.at || "") + " " + String(entry.scope || "error") + "\n" +
+          scrubDiagnosticText(entry.stack || entry.error) + (entry.repeats ? " ×" + entry.repeats : "");
+      }); }
+      lines = lines.concat(rows(state.diagnostics.trace));
+      lines.push("\nПОДРОБНОСТИ ОШИБОК");
+      lines = lines.concat(errorRows(state.errors));
+      lines.push("\nПРЕДЫДУЩИЙ ЗАПУСК");
+      lines = lines.concat(rows(state.diagnostics.previousJournal || []));
+      lines = lines.concat(errorRows(state.diagnostics.previousErrors || []));
+      logText.textContent = lines.join("\n"); logText.scrollTop = 0;
     }
 
     vkInputBridge.onState = function (status, detail) {
@@ -1091,13 +1251,21 @@
       });
     }
 
-    function networkEvent(transport, phase, status) {
+    function networkEvent(transport, phase, status, context) {
       // Never capture URLs, query strings, headers, SDP or message bodies.
       try {
         var entry = { at: new Date().toISOString(), transport: transport, phase: phase, status: Number(status) || 0 };
+        if (context) {
+          entry.endpoint = context.endpoint;
+          entry.method = context.method;
+          entry.elapsedMs = context.elapsedMs;
+        }
         state.diagnostics.network.push(entry);
         if (state.diagnostics.network.length > 40) state.diagnostics.network.shift();
-        if (phase === "failed" || phase === "error") queueReport(500);
+        if (phase === "failed" || phase === "error") {
+          traceEvent("network-" + transport, phase + " " + entry.status + " " + (entry.endpoint || ""));
+          queueReport(500);
+        }
         renderOverlay();
       } catch (_) {} // Observability must not change the transport's outcome.
     }
@@ -1107,22 +1275,36 @@
         var nativeFetch = win.fetch;
         win.fetch = function () {
           var args = arguments;
-          var isReport = args[0] === REPORT_URL;
+          var url = typeof args[0] === "string" ? args[0] : args[0] && args[0].url;
+          var endpoint = endpointCategory(url);
+          var isReport = endpoint === "report-relay";
+          var started = Date.now();
+          var method = String(args[1] && args[1].method || args[0] && args[0].method || "GET").toUpperCase();
+          var context = function () { return { endpoint: endpoint, method: /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/.test(method) ? method : "OTHER", elapsedMs: Date.now() - started }; };
           return nativeFetch.apply(this, args).then(function (response) {
-            if (!isReport && response.status >= 400) networkEvent("fetch", "failed", response.status);
+            if (!isReport && response.status >= 400) networkEvent("fetch", "failed", response.status, context());
             return response;
           }, function (error) {
-            if (!isReport) networkEvent("fetch", "error", 0);
+            if (!isReport) networkEvent("fetch", "error", 0, context());
             throw error;
           });
         };
       }
       if (win.XMLHttpRequest) {
+        var xhrContexts = new win.WeakMap();
+        var nativeOpen = win.XMLHttpRequest.prototype.open;
+        win.XMLHttpRequest.prototype.open = function (method, url) {
+          xhrContexts.set(this, { endpoint: endpointCategory(url), method: /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i.test(method) ? String(method).toUpperCase() : "OTHER" });
+          return nativeOpen.apply(this, arguments);
+        };
         var nativeSend = win.XMLHttpRequest.prototype.send;
         win.XMLHttpRequest.prototype.send = function () {
           var xhr = this;
+          var started = Date.now();
           function complete() {
-            if (xhr.status === 0 || xhr.status >= 400) networkEvent("xhr", "failed", xhr.status);
+            var context = xhrContexts.get(xhr) || {};
+            context.elapsedMs = Date.now() - started;
+            if (context.endpoint !== "report-relay" && (xhr.status === 0 || xhr.status >= 400)) networkEvent("xhr", "failed", xhr.status, context);
           }
           xhr.addEventListener("loadend", complete, { once: true });
           try { return nativeSend.apply(xhr, arguments); }
@@ -1869,7 +2051,7 @@
       var menuCombo = output.some(function (pad) {
         return pad && gamepadButtonPressed(pad.buttons[8]) && gamepadButtonPressed(pad.buttons[9]);
       });
-      if (state.streamMenuOpen || menuCombo) return output.map(function (pad) {
+      if (logsVisible || state.streamMenuOpen || menuCombo) return output.map(function (pad) {
         return pad ? neutralGamepadForVk(pad) : pad;
       });
       if (!streamMouseMode && !vkMouseComboLatched) return output;
@@ -2450,6 +2632,12 @@
 
       function frame(timestamp) {
         if (!virtualCursor) mount();
+        if (logsVisible) {
+          if (virtualCursor) virtualCursor.style.display = "none";
+          virtualCursorLastFrame = timestamp;
+          win.requestAnimationFrame(frame);
+          return;
+        }
         var streamActive = hasActiveGameStream();
         var elapsed = virtualCursorLastFrame
           ? timestamp - virtualCursorLastFrame
@@ -2639,6 +2827,7 @@
 
     function installRemoteNavigation() {
       var greenPressedAt = 0;
+      var redPressedAt = 0;
       var directions = {
         ArrowLeft: "left",
         ArrowRight: "right",
@@ -2651,10 +2840,17 @@
         function (event) {
           var keyCode = event.keyCode || event.which;
 
+          if (logsVisible && keyCode !== 403) {
+            event.preventDefault(); event.stopImmediatePropagation();
+            if (keyCode === 10009 || keyCode === 27 || keyCode === 405) showLogs(false);
+            else if (keyCode === 38 || keyCode === 40) logText.scrollTop += keyCode === 38 ? -220 : 220;
+            return;
+          }
+
           if (keyCode === 403) {
             event.preventDefault();
             event.stopImmediatePropagation();
-            sendReport("red-key");
+            if (!redPressedAt) redPressedAt = Date.now();
             return;
           }
           if (keyCode === 404) {
@@ -2713,6 +2909,9 @@
       );
       win.addEventListener("keyup", function (event) {
         var keyCode = event.keyCode || event.which;
+        if (logsVisible && keyCode !== 403) {
+          event.preventDefault(); event.stopImmediatePropagation(); return;
+        }
         if (keyCode >= 403 && keyCode <= 405 || keyCode === 406 && hasActiveGameStream()) {
           event.preventDefault();
           event.stopImmediatePropagation();
@@ -2723,8 +2922,13 @@
           if (held >= 1200) toggleNextQuality();
           else requestFullscreen();
         }
+        if (keyCode === 403 && redPressedAt) {
+          var redHeld = Date.now() - redPressedAt; redPressedAt = 0;
+          if (redHeld >= 1200) showLogs();
+          else sendReport("red-key");
+        }
       }, true);
-      win.addEventListener("blur", function () { greenPressedAt = 0; });
+      win.addEventListener("blur", function () { greenPressedAt = 0; redPressedAt = 0; });
       function onFullscreenChange() {
         if (!hasActiveGameStream()) return;
         var fullscreen = Boolean(doc.fullscreenElement || doc.webkitFullscreenElement);
@@ -2955,6 +3159,10 @@
         state.errors.length +
         " · Отчёт: " +
         state.reportStatus +
+        " · в очереди " + state.reporting.pending +
+        "\nСервис: " + state.reporting.service + " · хранение: " + state.reporting.storage +
+        "\nПередача: " + (state.reportError || state.reporting.lastDeliveredId || "—") +
+        "\nПоследняя ошибка: " + (state.errors.length ? state.errors[state.errors.length - 1].scope + ": " + state.errors[state.errors.length - 1].error.slice(0, 150) : "—") +
         "\nVK browser: " +
         state.vkBrowserGate +
         " · VK input: " +
@@ -2983,14 +3191,14 @@
         state.diagnostics.shell.averageFrameMs +
         " ms · long " +
         state.diagnostics.shell.longFrames +
-        "\nПоток: " + metric(stream.decodedFps) + " fps · " + metric(stream.bitrateMbps) + " Mbps · " + stream.codec +
+        "\nПоток" + (stream.stale ? " (старый замер)" : "") + ": " + metric(stream.decodedFps) + " fps · " + metric(stream.bitrateMbps) + " Mbps · " + stream.codec +
         "\nDecode: " + metric(stream.decodeMs) + " ms · буфер " + metric(stream.jitterBufferMs) + " ms" +
         "\nRTT: " + metric(stream.rttMs) + " ms · потери " + metric(stream.lossPercent) + "%" +
         "\nСеть: " + (lastNetwork ? lastNetwork.transport + " " + lastNetwork.phase + " " + lastNetwork.status : "ошибок не записано") +
         "\nЗапрошено: " + state.quality.active + " · после перезапуска: " + state.quality.next +
         "\nHDR потока: неизвестно · HDR ТВ: " + (state.diagnostics.display.hdrSupported == null ? "?" : state.diagnostics.display.hdrSupported ? "поддерживается" : "нет") +
         "\nL1+R1+Options = мышь · Create+Options = меню VK" +
-        "\nКрасная: отчёт · Синяя/Назад: меню · Жёлтая: скрыть" +
+        "\nКрасная: отчёт / держать 2 с: журнал · Синяя/Назад: меню · Жёлтая: скрыть" +
         "\nЗелёная: полный экран · держать 2 с: 1080p/1440p на следующий запуск";
     }
 
@@ -3006,7 +3214,7 @@
       return Promise.all(
         peerConnections.map(function (pc, index) {
           if (!pc.getStats || pc.connectionState === "closed") return Promise.resolve({ index: index, stats: [] });
-          return Promise.resolve().then(function () { return pc.getStats(); })
+          return withTimeout(Promise.resolve().then(function () { return pc.getStats(); }), 1500, "RTC getStats timeout")
             .then(function (report) {
               var stats = [];
               report.forEach(function (item) {
@@ -3057,7 +3265,7 @@
               return { index: index, stats: stats };
             })
             .catch(function (error) {
-              return { index: index, error: errorText(error), stats: [] };
+              return { index: index, error: scrubDiagnosticText(errorText(error)), stats: [] };
             });
         })
       );
@@ -3099,8 +3307,16 @@
         if (pending || doc.hidden) return;
         pending = true;
         collectStats().then(function (stats) {
-          state.diagnostics.stream = summarizeStreamMetrics(stats, previousStats);
-          previousStats = stats;
+          var failedSample = stats.filter(function (peer) { return Boolean(peer.error); });
+          if (failedSample.length) {
+            state.diagnostics.stream.stale = true;
+            state.diagnostics.stream.sampleError = failedSample[0].error;
+            recordError("rtc-stats", failedSample[0].error);
+          } else {
+            state.diagnostics.stream = summarizeStreamMetrics(stats, previousStats);
+            state.diagnostics.stream.stale = false;
+            previousStats = stats;
+          }
           state.diagnostics.history.push({
             at: new Date().toISOString(),
             shell: Object.assign({}, state.diagnostics.shell),
@@ -3133,8 +3349,10 @@
       summarizePeers();
       updateGamepads();
       return collectStats().then(function (rtcStats) {
-        return {
+        return scrubReport({
           schema: "vkplay-tizen-live/1",
+          reportId: runId + "-r" + (++reportSequence),
+          runId: runId,
           version: VERSION,
           generatedAt: new Date().toISOString(),
           reason: reason,
@@ -3153,7 +3371,7 @@
           },
           page: {
             origin: win.location.origin,
-            pathname: win.location.pathname
+            pathname: endpointCategory(win.location.href)
           },
           patches: {
             browserShim: state.browserShim,
@@ -3171,6 +3389,7 @@
             combinedTracks: state.combinedTracks
           },
           diagnostics: state.diagnostics,
+          reporting: Object.assign({}, state.reporting, { status: state.reportStatus, error: state.reportError }),
           quality: Object.assign({}, state.quality),
           input: {
             mode: streamMouseMode ? "mouse" : "gamepad",
@@ -3184,57 +3403,112 @@
           rtcStats: rtcStats,
           recentEvents: recentEvents.slice(-40),
           errors: state.errors.slice(-20)
-        };
+        });
       });
     }
 
+    function withTimeout(promise, milliseconds, message) {
+      return new Promise(function (resolve, reject) {
+        var timer = win.setTimeout(function () { reject(new Error(message)); }, milliseconds);
+        Promise.resolve(promise).then(function (value) { win.clearTimeout(timer); resolve(value); }, function (error) { win.clearTimeout(timer); reject(error); });
+      });
+    }
+
+    function relayRequest(path, report) {
+      if (!reportFetch) return Promise.reject(new Error("fetch unavailable"));
+      var controller = win.AbortController ? new win.AbortController() : null;
+      var timer = win.setTimeout(function () { if (controller) controller.abort(); }, 7000);
+      var request = Promise.resolve().then(function () {
+        return reportFetch(RELAY_URL + path, {
+          method: report ? "POST" : "GET", mode: "cors", cache: "no-store", credentials: "omit",
+          headers: report ? { "Content-Type": "application/json" } : undefined,
+          body: report ? JSON.stringify(report) : undefined,
+          signal: controller ? controller.signal : undefined
+        });
+      }).then(function (response) {
+        if (!response.ok) throw new Error("Relay HTTP " + response.status);
+        return response.json();
+      });
+      return withTimeout(request, 7500, "Relay timeout (service or local network unavailable)").then(function (value) {
+        win.clearTimeout(timer); return value;
+      }, function (error) { win.clearTimeout(timer); throw error; });
+    }
+
+    function acceptDelivery(ack, reportId) {
+      if (!ack || ack.ok !== true || ack.reportId !== reportId || ["delivered", "queued"].indexOf(ack.delivery) === -1) throw new Error("Invalid report delivery acknowledgement");
+      state.reporting.service = "ready";
+      if (ack.delivery === "delivered") {
+        outbox = outbox.filter(function (pending) { return pending.reportId !== reportId; });
+        persistOutbox();
+        state.reporting.lastDeliveredId = reportId;
+        if (reportId === state.reportId) { state.reportStatus = "sent"; state.reportError = null; }
+        traceEvent("report-delivered", reportId);
+      } else {
+        if (reportId === state.reportId) {
+          state.reportStatus = "queued";
+          state.reportError = "Сохранён сервисом ТВ; Мак пока не подтвердил" + (ack.upstreamFailure ? ": " + scrubDiagnosticText(ack.upstreamFailure) : "");
+        }
+        traceEvent("report-queued", reportId);
+      }
+    }
+
+    function flushOutbox() {
+      var pending = outbox.slice();
+      return pending.reduce(function (promise, report) {
+        return promise.then(function () {
+          return relayRequest("/report", report).then(function (ack) { acceptDelivery(ack, report.reportId); return ack; });
+        });
+      }, Promise.resolve(null));
+    }
+
+    function probeReportService() {
+      return relayRequest("/health").then(function (health) {
+        if (!health || health.service !== "vkplay-tv-report-relay") throw new Error("Unexpected report service");
+        state.reporting.service = "ready " + String(health.version || "");
+        state.reporting.serviceStorage = health.storage;
+        state.reporting.serviceQueued = health.queued == null ? health.queue : health.queued;
+      }).catch(function (error) {
+        state.reporting.service = "unavailable";
+        state.reportError = "Сервис ТВ: " + scrubDiagnosticText(errorText(error));
+      }).then(function () { renderOverlay(); });
+    }
+
     function sendReport(reason) {
+      if (!isCloudHost || !isTopLevelContext) return Promise.resolve(null);
       if (reportInFlight) return reportInFlight;
       if (reason === "automatic" && Date.now() < nextAutomaticReportAt) return Promise.resolve(null);
-      nextAutomaticReportAt = Date.now() + 15000;
+      nextAutomaticReportAt = Date.now() + 30000;
       state.reportStatus = "sending";
       state.reportError = null;
       renderOverlay();
       reportInFlight = buildReport(reason || "manual")
         .then(function (report) {
-          var controller = win.AbortController ? new win.AbortController() : null;
-          var timeout = win.setTimeout(function () {
-            if (controller) controller.abort();
-          }, 8000);
-          return win.fetch(REPORT_URL, {
-            method: "POST",
-            mode: "cors",
-            cache: "no-store",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(report),
-            signal: controller ? controller.signal : undefined
-          }).then(function (response) {
-            win.clearTimeout(timeout);
-            return response;
-          }, function (error) {
-            win.clearTimeout(timeout);
-            throw error;
-          });
-        })
-        .then(function (response) {
-          if (!response.ok) throw new Error("Report server HTTP " + response.status);
-          state.reportStatus = "sent";
-          addEvent("report", "sent to Mac");
-          return response.json();
+          // Bound disk use and serialization on the TV; this still retains
+          // recent raw RTC counters and the complete bounded error journal.
+          while (JSON.stringify(report).length > 240000 && report.diagnostics.history.length) report.diagnostics.history.shift();
+          if (JSON.stringify(report).length > 300000) throw new Error("Report too large to retain safely");
+          state.reportId = report.reportId;
+          outbox.push(report);
+          if (outbox.length > 3) { outbox.shift(); state.reporting.evicted += 1; }
+          persistOutbox(); persistJournal();
+          return flushOutbox();
         })
         .catch(function (error) {
           state.reportStatus = "failed";
-          state.reportError = errorText(error);
+          state.reportError = scrubDiagnosticText(errorText(error)) + (state.reporting.storage === "saved" ? "; сохранено на ТВ: " : "; только в памяти: ") + outbox.length;
           addEvent("report-failed", state.reportError);
           return null;
         }).then(function (result) {
           reportInFlight = null;
+          persistJournal(); renderOverlay();
+          if (logsVisible) showLogs(true);
           return result;
         });
       return reportInFlight;
     }
 
     function queueReport(delay) {
+      if (!isCloudHost || !isTopLevelContext) return;
       win.clearTimeout(reportTimer);
       reportTimer = win.setTimeout(function () {
         sendReport("automatic");
@@ -3242,10 +3516,10 @@
     }
 
     win.addEventListener("error", function (event) {
-      recordError("window", event.error || event.message);
+      if (isCloudHost && isTopLevelContext) recordError("window", event.error || event.message);
     });
     win.addEventListener("unhandledrejection", function (event) {
-      recordError("promise", event.reason);
+      if (isCloudHost && isTopLevelContext) recordError("promise", event.reason);
     });
 
     var publicApi = {
@@ -3254,6 +3528,8 @@
       state: state,
       patchSamsungSdp: patchSamsungSdp,
       sendReport: sendReport,
+      buildReport: buildReport,
+      showLogs: function () { showLogs(true); },
       showDiagnostics: function () {
         overlayVisible = true;
         if (overlay) overlay.style.opacity = "1";
@@ -3262,6 +3538,8 @@
     };
     win.__VKPLAY_TIZEN__ = publicApi;
 
+    restoreReportStorage();
+    installErrorJournal();
     installBrowserShim();
     if (isBootstrapPage) {
       state.inputMode = "bootstrap";
@@ -3301,7 +3579,11 @@
     installVirtualCursor();
     installGamepadMonitor();
     installDiagnosticsSampler();
-    if (isCloudHost) queueReport(2500);
+    if (isCloudHost && isTopLevelContext) {
+      win.setTimeout(probeReportService, 1000);
+      queueReport(2500);
+      win.setInterval(function () { if (outbox.length && !reportInFlight && !doc.hidden) sendReport("automatic"); }, 30000);
+    }
 
     addEvent("installed", VERSION);
     return publicApi;
